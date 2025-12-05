@@ -1,3 +1,4 @@
+// SelectionToolbar.js
 import React, { useState } from "react";
 
 const SelectionToolbar = ({
@@ -42,6 +43,12 @@ const SelectionToolbar = ({
   currentItalic = false,
   currentUnderline = false,
   currentStrike = false,
+
+  // HISTORY (new)
+  onUndo = () => {},
+  onRedo = () => {},
+  canUndo = false,
+  canRedo = false,
 }) => {
   const [openPanel, setOpenPanel] = useState(null);
   const [fontSearch, setFontSearch] = useState("");
@@ -92,6 +99,57 @@ const SelectionToolbar = ({
       <div className="relative inline-flex">
         {/* TOP TOOLBAR PILL */}
         <div className="flex items-center gap-2 rounded-full bg-white px-3 py-1 shadow-xl border border-slate-200">
+          {/* Undo/Redo buttons (new) */}
+          <div className="flex items-center gap-1">
+            <button
+              type="button"
+              onClick={(e) => {
+                e.stopPropagation();
+                if (canUndo && typeof onUndo === "function") onUndo();
+              }}
+              disabled={!canUndo}
+              aria-label="Undo (Ctrl/Cmd+Z)"
+              title="Undo (Ctrl/Cmd+Z)"
+              className={`p-1 rounded-md text-sm border flex items-center justify-center ${
+                canUndo
+                  ? "bg-white hover:bg-slate-50"
+                  : "bg-gray-100 text-slate-400 cursor-not-allowed"
+              }`}
+            >
+              <img
+                src="/icons/undo.png"
+                alt="undo"
+                className="h-4 w-4 object-contain"
+                aria-hidden
+              />
+            </button>
+
+            <button
+              type="button"
+              onClick={(e) => {
+                e.stopPropagation();
+                if (canRedo && typeof onRedo === "function") onRedo();
+              }}
+              disabled={!canRedo}
+              aria-label="Redo (Ctrl/Cmd+Y)"
+              title="Redo (Ctrl/Cmd+Y)"
+              className={`p-1 rounded-md text-sm border flex items-center justify-center ${
+                canRedo
+                  ? "bg-white hover:bg-slate-50"
+                  : "bg-gray-100 text-slate-400 cursor-not-allowed"
+              }`}
+            >
+              <img
+                src="/icons/redo.png"
+                alt="redo"
+                className="h-4 w-4 object-contain"
+                aria-hidden
+              />
+            </button>
+          </div>
+
+          <div className="h-4 w-px bg-slate-200" />
+
           {/* FONT dropdown */}
           {blockType === "text" && fontList && fontList.length > 0 && (
             <>
@@ -177,6 +235,7 @@ const SelectionToolbar = ({
                             <div className="flex-1 truncate">{f.label}</div>
                           </button>
                         ))}
+
                       {fontList.filter((f) =>
                         f.label.toLowerCase().includes(fontSearch.toLowerCase())
                       ).length === 0 && (
@@ -283,6 +342,7 @@ const SelectionToolbar = ({
             Position
           </button>
           <div className="h-4 w-px bg-slate-200" />
+
           {/* FLIP — ONLY for images */}
           {blockType === "image" && (
             <>
@@ -297,6 +357,7 @@ const SelectionToolbar = ({
               <div className="h-4 w-px bg-slate-200" />
             </>
           )}
+
           {/* ROUNDING — ONLY for images */}
           {blockType === "image" && (
             <>
@@ -316,6 +377,7 @@ const SelectionToolbar = ({
               <div className="h-4 w-px bg-slate-200" />
             </>
           )}
+
           {/* Transparency */}
           <button
             className="p-1 hover:bg-slate-100 rounded flex items-center"
@@ -329,6 +391,7 @@ const SelectionToolbar = ({
               alt="transparency"
             />
           </button>
+
           {/* TEXT CONTROLS (existing) */}
           {blockType === "text" && (
             <>
@@ -363,8 +426,10 @@ const SelectionToolbar = ({
               </button>
             </>
           )}
+
           {/* Divider */}
           <div className="h-4 w-px bg-slate-200" />
+
           {/* NEW: Background color picker (native) */}
           <label
             className="flex items-center gap-2 rounded px-2 py-1 hover:bg-slate-50 cursor-pointer"
@@ -388,6 +453,7 @@ const SelectionToolbar = ({
             />
           </label>
           <div className="h-4 w-px bg-slate-200" />
+
           {/* TEXT COLOR PICKER (NEW) */}
           {blockType === "text" && (
             <>
@@ -413,6 +479,7 @@ const SelectionToolbar = ({
               <div className="h-4 w-px bg-slate-200" />
             </>
           )}
+
           {/* New text button */}
           <button
             className="flex items-center gap-2 rounded px-2 py-1 hover:bg-slate-50 text-sm"

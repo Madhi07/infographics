@@ -150,7 +150,7 @@ export const hasNumericSize = (block) => {
 //  * position.x / position.y are in px relative to canvas.
 //  */
 export const buildBlockStyle = (block) => {
-  const style = {};
+  const style = { position: "absolute"};
 
   if (typeof block.position?.x === "number") {
     style.left = `${block.position.x}px`;
@@ -192,6 +192,18 @@ export const buildBlockStyle = (block) => {
     style.color = block.textColor;
   }
 
+  if (block.crop) {
+    // crop = { top, right, bottom, left } in percent
+    const { top = 0, right = 0, bottom = 0, left = 0 } = block.crop;
+
+    // inset takes top right bottom left in CSS units; percent relative to box size works well
+    style.clipPath = `inset(${top}% ${right}% ${bottom}% ${left}%)`;
+    // also useful for older browsers / as fallback:
+    style.overflow = "hidden";
+    // optionally - improve hit-testing reliability
+    style.pointerEvents = "auto";
+  }
+
   // APPLY BACKGROUND (new)
   // Accepts values like "#fff", "rgba(0,0,0,0.5)", "linear-gradient(...)" or image urls
   if (typeof block.background === "string" && block.background.trim() !== "") {
@@ -230,7 +242,19 @@ export const buildBlockStyle = (block) => {
 
   if (transforms.length > 0) {
     style.transform = transforms.join(" ");
-    style.transformOrigin = "center";
+    // If block has a crop, pivot around the visible (cropped) center.
+    if (block.crop) {
+      const { left = 0, right = 0, top = 0, bottom = 0 } = block.crop;
+      const visibleWidthPercent = 100 - (left + right);
+      const visibleHeightPercent = 100 - (top + bottom);
+
+      const visibleCenterXPercent = left + visibleWidthPercent / 2;
+      const visibleCenterYPercent = top + visibleHeightPercent / 2;
+
+      style.transformOrigin = `${visibleCenterXPercent}% ${visibleCenterYPercent}%`;
+    } else {
+      style.transformOrigin = "center";
+    }
   }
 
   if (typeof block.zIndex === "number") {

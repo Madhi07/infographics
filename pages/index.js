@@ -1,4 +1,3 @@
-// index.js (updated - full file)
 import Image from "next/image";
 import {
   useCallback,
@@ -11,8 +10,10 @@ import SelectionOverlay from "@/components/SelectionOverlay";
 import SelectionToolbar from "@/components/SelectionToolbar";
 import HelperToolbar from "@/components/HelperToolbar";
 import PositionPanel from "@/components/PositionPanel";
-import infographicData from "@/constants/infographicData";
-import useInfograhicsData from "@/hooks/useInfographicData";
+import useInfograhisData from "@/hooks/useInfographicData";
+import { useContext } from "react";
+import { InfographicsContext } from "@/pages/_app"; // wherever you placed it
+import { observer } from "mobx-react-lite";
 import {
   baseCanvas,
   textVariants,
@@ -26,28 +27,49 @@ import {
   buildBlockStyle,
   fontFamilies,
 } from "@/utils/canvasConfig";
+import {
+  MoveCommand,
+  ResizeCommand,
+  RotateCommand,
+  CropCommand,
+  AddBlockCommand,
+  TextChangeCommand,
+  DuplicateCommand,
+  DeleteBlockCommand,
+  GroupCommand,
+  UngroupCommand,
+  ZIndexCommand,
+  GroupTransformCommand,
+  SetBackgroundCommand,
+  AddPageCommand,
+  RemovePageCommand,
+} from "@/stores/commands";
 
-export default function Home() {
-  const {
-    project,
-    activePageId,
-    setActivePageId,
-    activePage,
-    activeBlocks,
-    updateActivePageBlocks,
-    importProject,
-    switchToPage,
-    blockRefs, // ref container (exposed by hook if you need)
-    setBlockRef, // fn to set ref in JSX
-    getBlockRef,
-    getBlockById, // convenience from hook
-    snapshot,
-    undo,
-    redo,
-    canUndo,
-    canRedo,
-  } = useInfograhicsData({ initialData: infographicData });
-  const [groups, setGroups] = useState([]);
+const deepClone = (v) => {
+  try {
+    return JSON.parse(JSON.stringify(v));
+  } catch (e) {
+    // fallback to structuredClone if available, otherwise return shallow copy
+    if (typeof structuredClone === "function") return structuredClone(v);
+    if (v && typeof v === "object")
+      return Array.isArray(v) ? v.slice() : { ...v };
+    return v;
+  }
+};
+
+function Home() {
+  const store = useContext(InfographicsContext);
+  if (!store) {
+    return null; // or a loader UI
+  }
+
+  const project = store.project;
+  const activePage = store.activePage;
+  const activePageId = store.activePageId;
+  const activeBlocks = store.blocks;
+  const groups = store.groups;
+  const getBlockById = store.getBlockById;
+  const snapshot = store.beginSnapshot;
   const [selectedIds, setSelectedIds] = useState([]); // supports multi-select and group selection
   const [activeId, setActiveId] = useState(null); // single active id (block id or group id)
   const [editingBlockId, setEditingBlockId] = useState(null);
@@ -62,6 +84,10 @@ export default function Home() {
   const canvasRef = useRef(null);
   const interactionRef = useRef(null);
   const workspaceRef = useRef(null);
+  const editingOriginalRef = useRef({});
+  const measurementRAFRef = useRef(null);
+  const handlePointerMoveRef = useRef();
+  const endInteractionRef = useRef();
 
   // -------------------------
   // Initialize positions (same as before)
@@ -71,92 +97,122 @@ export default function Home() {
 
     const canvasRect = canvasRef.current.getBoundingClientRect();
 
-    updateActivePageBlocks((prev) =>
-      prev.map((block, index) => {
-        let updated = { ...block };
+    // read blocks from store
+    const blocks = (store.blocks || []).slice();
 
-        if (typeof updated.zIndex !== "number") {
-          updated.zIndex = index;
-        }
+    const updatedBlocks = blocks.map((block, index) => {
+      let updated = { ...block };
 
-        if (updated.position) {
-          const { x, y } = updated.position;
+      // ensure zIndex exists (fall back to index)
+      if (typeof updated.zIndex !== "number") {
+        updated.zIndex = index;
+      }
+
+      // convert percent positions to px if present (assumes stored percents)
+      if (updated.position) {
+        const { x, y } = updated.position;
+        // guard for numeric percent-like values (0..100)
+        if (typeof x === "number" && x <= 100 && x >= -100) {
           updated.position = {
             x: (x / 100) * canvasRect.width,
             y: (y / 100) * canvasRect.height,
           };
+        } else {
+          // already px or unknown — keep as-is (but clone)
+          updated.position = {
+            x: updated.position.x ?? 0,
+            y: updated.position.y ?? 0,
+          };
         }
+      }
 
-        if (updated.type === "text") {
-          const defaultWidths = {
-            big: 0.76,
-            normal: 0.6,
-            small: 0.5,
-            bold: 0.4,
-          };
-          const defaultFontSizes = {
-            big: 32,
-            normal: 18,
-            small: 10,
-            bold: 24,
-          };
-          if (!updated.color) updated.color = "#000000";
-          const variant = updated.variant || "normal";
-          const frac = defaultWidths[variant] ?? 0.6;
+      // text defaults: width (px) and base font size
+      if (updated.type === "text") {
+        const defaultWidths = {
+          big: 0.76,
+          normal: 0.6,
+          small: 0.5,
+          bold: 0.4,
+        };
+        const defaultFontSizes = {
+          big: 32,
+          normal: 18,
+          small: 10,
+          bold: 24,
+        };
 
-          const currentWidth = updated.size?.width;
+        if (!updated.color) updated.color = "#000000";
+        const variant = updated.variant || "normal";
+        const frac = defaultWidths[variant] ?? 0.6;
 
-          let widthPx;
-          if (typeof currentWidth === "number") {
-            widthPx = currentWidth;
-          } else if (
-            typeof currentWidth === "string" &&
-            currentWidth.endsWith("%")
-          ) {
-            const num = parseFloat(currentWidth);
-            if (!Number.isNaN(num)) {
-              widthPx = (num / 100) * canvasRect.width;
-            } else {
-              widthPx = frac * canvasRect.width;
-            }
+        const currentWidth = updated.size?.width;
+
+        let widthPx;
+        if (typeof currentWidth === "number") {
+          widthPx = currentWidth;
+        } else if (
+          typeof currentWidth === "string" &&
+          currentWidth.endsWith("%")
+        ) {
+          const num = parseFloat(currentWidth);
+          if (!Number.isNaN(num)) {
+            widthPx = (num / 100) * canvasRect.width;
           } else {
             widthPx = frac * canvasRect.width;
           }
-
-          const baseFontSize =
-            typeof updated.fontSize === "number"
-              ? updated.fontSize
-              : defaultFontSizes[variant] ?? 16;
-
-          updated.size = {
-            ...(updated.size || {}),
-            width: widthPx,
-          };
-          updated.fontSize = baseFontSize;
+        } else {
+          widthPx = frac * canvasRect.width;
         }
 
-        return updated;
-      })
-    );
+        const baseFontSize =
+          typeof updated.fontSize === "number"
+            ? updated.fontSize
+            : defaultFontSizes[variant] ?? 16;
+
+        updated.size = {
+          ...(updated.size || {}),
+          width: widthPx,
+        };
+        updated.fontSize = baseFontSize;
+      }
+
+      return updated;
+    });
+
+    // write back to store (replace active page blocks)
+    if (typeof store.setBlocks === "function") {
+      store.setBlocks(updatedBlocks);
+    } else {
+      // fallback: mutate the active page directly
+      const page = store.project.pages.find((p) => p.id === store.activePageId);
+      if (page) page.blocks = updatedBlocks;
+    }
 
     setPositionsInitialized(true);
-  }, [positionsInitialized, activePageId, activeBlocks]);
+  }, [positionsInitialized, store, canvasRef, setPositionsInitialized]);
 
   useEffect(() => {
     const onKey = (e) => {
       const cmd = e.ctrlKey || e.metaKey;
       if (!cmd) return;
-      if (e.key === "z" && !e.shiftKey) {
+
+      // Undo: Cmd/Ctrl + Z
+      if (e.key.toLowerCase() === "z" && !e.shiftKey) {
         e.preventDefault();
-        if (canUndo) undo();
-      } else if (e.key === "y" || (e.key === "z" && e.shiftKey)) {
+        if (store.canUndo) store.undo();
+      }
+      // Redo: Cmd/Ctrl + Shift + Z  OR  Cmd/Ctrl + Y
+      if (
+        e.key.toLowerCase() === "y" ||
+        (e.key.toLowerCase() === "z" && e.shiftKey)
+      ) {
         e.preventDefault();
-        if (canRedo) redo();
+        if (store.canRedo) store.redo();
       }
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [undo, redo, canUndo, canRedo]);
+  }, [store]);
 
   // -------------------------
   // Helpers
@@ -166,6 +222,14 @@ export default function Home() {
     (id) => groups.find((g) => g.id === id),
     [groups]
   );
+  const getGroupBlockIds = (group) => {
+    if (!group) return [];
+    if (Array.isArray(group.childIds) && group.childIds.length)
+      return group.childIds.slice();
+    if (Array.isArray(group.blockIds) && group.blockIds.length)
+      return group.blockIds.slice();
+    return [];
+  };
 
   // compute center/top-left of current selection for helper toolbar positioning
   const computeSelectionBounds = useCallback(() => {
@@ -174,20 +238,24 @@ export default function Home() {
 
     const canvasRect = canvasRef.current.getBoundingClientRect();
 
-    // collect DOM rects for blocks in selection
+    // collect DOM rects for each selected id (groups expand to child DOM rects)
     const rects = selectedIds
       .flatMap((id) => {
         if (isGroupId(id)) {
-          const g = getGroupById(id);
-          console.log(g);
+          const g = store.getGroupById?.(id);
           if (!g) return [];
-          // group blocks DOM rects:
-          return g.blockIds
-            .map((bid) => getBlockRef(activePageId, bid))
+          const childIds =
+            Array.isArray(g.childIds) && g.childIds.length
+              ? g.childIds
+              : Array.isArray(g.blockIds) && g.blockIds.length
+              ? g.blockIds
+              : [];
+          return childIds
+            .map((bid) => store.getBlockRef(store.activePageId, bid))
             .filter(Boolean)
             .map((el) => el.getBoundingClientRect());
         } else {
-          const el = getBlockRef(activePageId, id);
+          const el = store.getBlockRef(store.activePageId, id);
           return el ? [el.getBoundingClientRect()] : [];
         }
       })
@@ -203,138 +271,234 @@ export default function Home() {
       return { left, top, right, bottom, centerX, centerY };
     }
 
-    // fallback to first item's canvas position
+    // Fallback: compute from store (canvas-local coords) for first selected item
     const firstId = selectedIds[0];
     if (!firstId) return null;
-    if (isGroupId(firstId)) {
-      const g = getGroupById(firstId);
-      if (!g) return null;
-      return {
-        left: canvasRef.current.getBoundingClientRect().left + g.position.x,
-        top: canvasRef.current.getBoundingClientRect().top + g.position.y,
-        centerX:
-          canvasRef.current.getBoundingClientRect().left +
-          g.position.x +
-          g.size.width / 2,
-        centerY:
-          canvasRef.current.getBoundingClientRect().top +
-          g.position.y +
-          g.size.height / 2,
-      };
-    } else {
-      const b = getBlockById(firstId);
-      if (!b) return null;
-      return {
-        left: canvasRef.current.getBoundingClientRect().left + b.position.x,
-        top: canvasRef.current.getBoundingClientRect().top + b.position.y,
-        centerX:
-          canvasRef.current.getBoundingClientRect().left +
-          b.position.x +
-          (b.size?.width || 0) / 2,
-        centerY:
-          canvasRef.current.getBoundingClientRect().top +
-          b.position.y +
-          (b.size?.height || 0) / 2,
-      };
-    }
-  }, [
-    selectedIds,
-    groups,
-    activePageId,
-    activeBlocks,
-    getBlockRef,
-    getGroupById,
-    getBlockById,
-  ]);
 
-  // -------------------------
-  // Text handlers (unchanged)
-  // -------------------------
+    if (isGroupId(firstId)) {
+      const g = store.getGroupById?.(firstId);
+      if (!g) return null;
+      const left = canvasRect.left + (g.position?.x ?? 0);
+      const top = canvasRect.top + (g.position?.y ?? 0);
+      const centerX = left + (g.size?.width ?? 0) / 2;
+      const centerY = top + (g.size?.height ?? 0) / 2;
+      const right = left + (g.size?.width ?? 0);
+      const bottom = top + (g.size?.height ?? 0);
+      return { left, top, right, bottom, centerX, centerY };
+    } else {
+      const b = store.getBlockById?.(firstId);
+      if (!b) return null;
+      const left = canvasRect.left + (b.position?.x ?? 0);
+      const top = canvasRect.top + (b.position?.y ?? 0);
+      const centerX = left + (b.size?.width ?? 0) / 2;
+      const centerY = top + (b.size?.height ?? 0) / 2;
+      const right = left + (b.size?.width ?? 0);
+      const bottom = top + (b.size?.height ?? 0);
+      return { left, top, right, bottom, centerX, centerY };
+    }
+  }, [selectedIds, store.getBlockRef, isGroupId, store, canvasRef]);
+
+  // --- Text content change (typing) ---
+  // Live update only (no undo command per keystroke).
   const handleTextChange = useCallback(
     (blockId, value) => {
-      updateActivePageBlocks((prev) =>
-        prev.map((block) =>
-          block.id === blockId ? { ...block, content: value } : block
-        )
-      );
+      if (!blockId) return;
+      // immediate live update
+      store.updateBlock(blockId, { content: value });
     },
-    [updateActivePageBlocks]
+    [store]
   );
 
+  // --- Opacity change (undoable) ---
   const handleChangeOpacity = useCallback(
     (value) => {
-      updateActivePageBlocks((prev) =>
-        prev.map((block) =>
-          block.id === activeId ? { ...block, opacity: value } : block
-        )
-      );
+      if (!activeId) return;
+      const b = store.getBlockById?.(activeId);
+      if (!b) return;
+      const oldValue = typeof b.opacity === "number" ? b.opacity : 1;
+      if (oldValue === value) return;
+
+      // live update
+      store.updateBlock(activeId, { opacity: value });
+
+      // push undoable command
+      const cmd = {
+        do(s) {
+          s.updateBlock(activeId, { opacity: value });
+        },
+        undo(s) {
+          s.updateBlock(activeId, { opacity: oldValue });
+        },
+      };
+      store.applyCommand(cmd);
     },
-    [activeId, updateActivePageBlocks]
+    [store, activeId]
   );
 
+  // you can capture the pre-edit snapshot when editing starts and compare here.
   const stopEditing = useCallback(() => {
-    snapshot();
-    setEditingBlockId(null);
-  }, [snapshot]);
+    const blockId = editingBlockId;
+    if (blockId) {
+      const oldContent = editingOriginalRef.current[blockId];
+      const b = store.getBlockById?.(blockId);
+      const newContent = b ? b.content : null;
 
+      // if changed, push a single TextChangeCommand into MobX command stack
+      if (oldContent !== newContent) {
+        // TextChangeCommand expects (blockId, oldPatch, newPatch)
+        store.applyCommand(
+          TextChangeCommand(
+            blockId,
+            { content: oldContent ?? "" },
+            { content: newContent ?? "" }
+          )
+        );
+      }
+
+      // cleanup
+      delete editingOriginalRef.current[blockId];
+    }
+
+    // clear UI editing state
+    setEditingBlockId(null);
+  }, [editingBlockId, store]);
+
+  // --- Flip horizontal (undoable) ---
   const handleFlipHorizontal = useCallback(() => {
     if (!activeId) return;
-    updateActivePageBlocks((prev) =>
-      prev.map((block) =>
-        block.id === activeId ? { ...block, flipH: !block.flipH } : block
-      )
-    );
-  }, [activeId, updateActivePageBlocks]);
+    const b = store.getBlockById?.(activeId);
+    if (!b) return;
+    const oldVal = !!b.flipH;
+    const newVal = !oldVal;
 
+    // live
+    store.updateBlock(activeId, { flipH: newVal });
+
+    const cmd = {
+      do(s) {
+        s.updateBlock(activeId, { flipH: newVal });
+      },
+      undo(s) {
+        s.updateBlock(activeId, { flipH: oldVal });
+      },
+    };
+    store.applyCommand(cmd);
+  }, [store, activeId]);
+
+  // --- Flip vertical (undoable) ---
   const handleFlipVertical = useCallback(() => {
     if (!activeId) return;
-    updateActivePageBlocks((prev) =>
-      prev.map((block) =>
-        block.id === activeId ? { ...block, flipV: !block.flipV } : block
-      )
-    );
-  }, [activeId, updateActivePageBlocks]);
+    const b = store.getBlockById?.(activeId);
+    if (!b) return;
+    const oldVal = !!b.flipV;
+    const newVal = !oldVal;
 
+    // live
+    store.updateBlock(activeId, { flipV: newVal });
+
+    const cmd = {
+      do(s) {
+        s.updateBlock(activeId, { flipV: newVal });
+      },
+      undo(s) {
+        s.updateBlock(activeId, { flipV: oldVal });
+      },
+    };
+    store.applyCommand(cmd);
+  }, [store, activeId]);
+
+  // --- Border radius change (undoable) ---
   const handleChangeBorderRadius = useCallback(
     (value) => {
       if (!activeId) return;
-      updateActivePageBlocks((prev) =>
-        prev.map((block) =>
-          block.id === activeId ? { ...block, borderRadius: value } : block
-        )
-      );
+      const b = store.getBlockById?.(activeId);
+      if (!b) return;
+      const oldVal = typeof b.borderRadius !== "undefined" ? b.borderRadius : 0;
+      if (oldVal === value) return;
+
+      // live update
+      store.updateBlock(activeId, { borderRadius: value });
+
+      // push undoable command
+      const cmd = {
+        do(s) {
+          s.updateBlock(activeId, { borderRadius: value });
+        },
+        undo(s) {
+          s.updateBlock(activeId, { borderRadius: oldVal });
+        },
+      };
+      store.applyCommand(cmd);
     },
-    [activeId, updateActivePageBlocks]
+    [store, activeId]
   );
 
   const handleChangeFontFamily = useCallback(
     (fontValue) => {
-      if (!selectedIds || selectedIds.length === 0) return;
+      if (!fontValue) return;
 
-      // If single selection is a group, apply to text blocks inside the group
-      if (selectedIds.length === 1 && isGroupId(selectedIds[0])) {
-        const gid = selectedIds[0];
-        const group = getGroupById(gid);
-        if (!group) return;
-        updateActivePageBlocks((prev) =>
-          prev.map((b) =>
-            group.blockIds.includes(b.id) && b.type === "text"
-              ? { ...b, fontFamily: fontValue }
-              : b
-          )
-        );
-        return;
+      // Resolve selection (prefer selectedIds, fallback to activeId)
+      const selIds =
+        selectedIds && selectedIds.length
+          ? selectedIds.slice()
+          : activeId
+          ? [activeId]
+          : [];
+
+      if (selIds.length === 0) return;
+
+      // If single selection is a group, expand to group's child text blocks
+      let targetIds = selIds;
+      if (selIds.length === 1 && isGroupId(selIds[0])) {
+        const g = store.getGroupById?.(selIds[0]);
+        if (!g) return;
+        targetIds =
+          Array.isArray(g.childIds) && g.childIds.length
+            ? g.childIds.slice()
+            : Array.isArray(g.blockIds) && g.blockIds.length
+            ? g.blockIds.slice()
+            : [];
       }
 
-      updateActivePageBlocks((prev) =>
-        prev.map((b) =>
-          selectedIds.includes(b.id) && b.type === "text"
-            ? { ...b, fontFamily: fontValue }
-            : b
-        )
-      );
+      // Filter to existing text blocks
+      const textIds = targetIds.filter((id) => {
+        const b = store.getBlockById?.(id);
+        return b && b.type === "text";
+      });
+
+      if (textIds.length === 0) return;
+
+      // Build old/new maps
+      const oldMap = {};
+      const newMap = {};
+      textIds.forEach((id) => {
+        const b = store.getBlockById(id);
+        oldMap[id] = {
+          fontFamily: typeof b.fontFamily !== "undefined" ? b.fontFamily : null,
+        };
+        newMap[id] = { fontFamily: fontValue };
+      });
+
+      // Apply live updates
+      textIds.forEach((id) => store.updateBlock(id, { fontFamily: fontValue }));
+
+      // Batch command for undo/redo
+      const cmd = {
+        do(s) {
+          Object.entries(newMap).forEach(([id, patch]) =>
+            s.updateBlock(id, patch)
+          );
+        },
+        undo(s) {
+          Object.entries(oldMap).forEach(([id, patch]) =>
+            s.updateBlock(id, patch)
+          );
+        },
+      };
+
+      store.applyCommand(cmd);
     },
-    [selectedIds, groups, updateActivePageBlocks]
+    [store, selectedIds, activeId, isGroupId]
   );
 
   // -------------------------
@@ -352,7 +516,7 @@ export default function Home() {
       return;
     }
 
-    const el = getBlockRef(activePageId, activeBlock.id);
+    const el = store.getBlockRef(activePageId, activeBlock.id);
     if (!el) {
       setActiveRectState(null);
       return;
@@ -364,7 +528,7 @@ export default function Home() {
 
     // second pass on next frame to catch font/layout shifts
     let raf = requestAnimationFrame(() => {
-      const el2 = getBlockRef(activePageId, activeBlock.id);
+      const el2 = store.getBlockRef(activePageId, activeBlock.id);
       if (!el2) return;
       const rect2 = el2.getBoundingClientRect();
       setActiveRectState(rect2);
@@ -393,8 +557,12 @@ export default function Home() {
         // Groups always get corner handles for resizing
         activeCornerHandles = cornerHandles;
 
-        // Groups get side handles for cropping if they contain images
-        const hasImages = group.blockIds.some((id) => {
+        const groupBlockIds = Array.isArray(group.blockIds)
+          ? group.blockIds
+          : Array.isArray(group.childIds)
+          ? group.childIds
+          : [];
+        const hasImages = groupBlockIds.some((id) => {
           const block = activeBlocks.find((b) => b.id === id);
           return block && block.type === "image";
         });
@@ -644,6 +812,17 @@ export default function Home() {
     setEditingBlockId(block.id);
   }, []);
 
+  const startEditing = useCallback(
+    (blockId) => {
+      if (!blockId) return;
+      const b = store.getBlockById?.(blockId);
+      editingOriginalRef.current[blockId] = b ? b.content : null;
+      setActiveId(blockId);
+      setEditingBlockId(blockId);
+    },
+    [store]
+  );
+
   // -------------------------
   // Interaction: move / resize / rotate
   // - supports group move if blockId is group id (g-...)
@@ -655,16 +834,70 @@ export default function Home() {
 
       const { blockId, blockSnapshot, canvasRect, type } = interaction;
 
-      // GROUP MOVE branch: if blockId is group id, update each child by delta
+      // helper: schedule a DOM measurement for given block ids (coalesced)
+      const scheduleMeasureForIds = (ids = []) => {
+        if (measurementRAFRef.current)
+          cancelAnimationFrame(measurementRAFRef.current);
+        measurementRAFRef.current = requestAnimationFrame(() => {
+          try {
+            const elems = (ids || [])
+              .map((id) => store.getBlockRef(activePageId, id))
+              .filter(Boolean);
+            if (elems.length > 0) {
+              const rects = elems.map((el) => el.getBoundingClientRect());
+              const left = Math.min(...rects.map((r) => r.left));
+              const top = Math.min(...rects.map((r) => r.top));
+              const right = Math.max(...rects.map((r) => r.right));
+              const bottom = Math.max(...rects.map((r) => r.bottom));
+              setActiveRectState({
+                left,
+                top,
+                right,
+                bottom,
+                width: right - left,
+                height: bottom - top,
+              });
+              return;
+            }
+
+            // fallback: try single id model-based measurement if no DOM elems found
+            if (ids && ids.length === 1) {
+              const id = ids[0];
+              const blk = store.getBlockById?.(id);
+              const canvasR = canvasRef.current?.getBoundingClientRect();
+              if (blk && canvasR) {
+                const left = canvasR.left + (blk.position?.x ?? 0);
+                const top = canvasR.top + (blk.position?.y ?? 0);
+                const width = blk.size?.width ?? 0;
+                const height = blk.size?.height ?? 0;
+                setActiveRectState({
+                  left,
+                  top,
+                  right: left + width,
+                  bottom: top + height,
+                  width,
+                  height,
+                });
+                return;
+              }
+            }
+          } catch (err) {
+            // ignore measurement errors
+          } finally {
+            measurementRAFRef.current = null;
+          }
+        });
+      };
+
+      // --- GROUP MOVE branch ---
       if (isGroupId(blockId) && type === "move") {
         const deltaX = event.clientX - interaction.startX;
         const deltaY = event.clientY - interaction.startY;
 
-        // Use canvasRect that was captured at beginInteraction
-        const canvasRect =
+        // canvasRect captured at beginInteraction (fallback to DOM)
+        const capturedCanvasRect =
           interaction.canvasRect || canvasRef.current?.getBoundingClientRect();
 
-        // Try to use a workspaceRef (preferred). If you don't have one, fallback to window dimensions.
         const workspaceRect =
           typeof workspaceRef !== "undefined" && workspaceRef.current
             ? workspaceRef.current.getBoundingClientRect()
@@ -675,12 +908,11 @@ export default function Home() {
                 height: window.innerHeight,
               };
 
-        // new group top-left in canvas-local coords:
-        // interaction.groupSnapshotPosition is already canvas-local (per your comment)
-        let newGroupX = interaction.groupSnapshotPosition.x + deltaX;
-        let newGroupY = interaction.groupSnapshotPosition.y + deltaY;
+        // new group top-left in canvas-local coords
+        let newGroupX = (interaction.groupSnapshotPosition?.x ?? 0) + deltaX;
+        let newGroupY = (interaction.groupSnapshotPosition?.y ?? 0) + deltaY;
 
-        // Compute effective axis-aligned size of the group (accounts for rotation)
+        // compute effective axis-aligned size (account for rotation)
         const gw = interaction.blockSnapshot?.size?.width ?? 0;
         const gh = interaction.blockSnapshot?.size?.height ?? 0;
         const gtheta =
@@ -690,74 +922,69 @@ export default function Home() {
         const effectiveGroupW = Math.abs(gw * gc) + Math.abs(gh * gs);
         const effectiveGroupH = Math.abs(gw * gs) + Math.abs(gh * gc);
 
-        // workspaceRect.left/top are in viewport coordinates; canvasRect.left/top are too.
-        // So workspace-left-in-canvas = workspaceRect.left - canvasRect.left
         const workspaceLeftInCanvas =
-          workspaceRect.left - (canvasRect?.left ?? 0);
-        const workspaceTopInCanvas = workspaceRect.top - (canvasRect?.top ?? 0);
+          workspaceRect.left - (capturedCanvasRect?.left ?? 0);
+        const workspaceTopInCanvas =
+          workspaceRect.top - (capturedCanvasRect?.top ?? 0);
         const workspaceRightInCanvas =
           workspaceLeftInCanvas + workspaceRect.width;
         const workspaceBottomInCanvas =
           workspaceTopInCanvas + workspaceRect.height;
 
-        // minX/minY allow some negative so user can pull the group left/top outside the canvas.
-        // maxX/maxY prevent the group's visual right/bottom from escaping the workspace.
-        const allowOutsideFactor = 0.9; // same as single-block logic
+        const allowOutsideFactor = 0.9;
         const minX =
           workspaceLeftInCanvas - effectiveGroupW * allowOutsideFactor;
         const minY =
           workspaceTopInCanvas - effectiveGroupH * allowOutsideFactor;
-
-        // For the right/bottom, ensure group's right/bottom (top-left + effective size)
-        // does not go beyond workspace right/bottom.
         const maxX = workspaceRightInCanvas - effectiveGroupW;
         const maxY = workspaceBottomInCanvas - effectiveGroupH;
 
-        // Apply clamp
         const clampedGroupX = Math.min(Math.max(newGroupX, minX), maxX);
         const clampedGroupY = Math.min(Math.max(newGroupY, minY), maxY);
 
-        // Update each child position = groupTopLeft + child's saved offset
-        updateActivePageBlocks((prev) =>
-          prev.map((blk) => {
-            if (!interaction.groupBlockIds.includes(blk.id)) return blk;
-            const offset = interaction.blockOffsets?.[blk.id] || { x: 0, y: 0 };
+        // Use offsets captured at beginInteraction: interaction.blockOffsets (map id->offset)
+        const offsets = interaction.blockOffsets || {};
+        const childIds = interaction.groupBlockIds || [];
 
-            // If you stored each child's rotation/size snapshot and want to keep perfect bounds,
-            // you could reapply child-level rotation-aware clamps here. For parity with single-block
-            // move, we just set top-left = groupTopLeft + offset.
-            return {
-              ...blk,
-              position: {
-                x: clampedGroupX + offset.x,
-                y: clampedGroupY + offset.y,
-              },
-            };
-          })
-        );
+        // Update each child live
+        childIds.forEach((childId) => {
+          const offset = offsets[childId] || { x: 0, y: 0 };
+          store.updateBlock(childId, {
+            position: {
+              x: clampedGroupX + offset.x,
+              y: clampedGroupY + offset.y,
+            },
+          });
+        });
 
-        // also update group meta position live so overlay stays in sync
-        setGroups((prev) =>
-          prev.map((g) =>
-            g.id === blockId
-              ? { ...g, position: { x: clampedGroupX, y: clampedGroupY } }
-              : g
-          )
-        );
+        // update group meta live so overlay remains in sync
+        // group object should exist in store.groups
+        if (typeof store.updateGroup === "function") {
+          store.updateGroup(blockId, {
+            position: { x: clampedGroupX, y: clampedGroupY },
+          });
+        } else {
+          const g = store.getGroupById?.(blockId);
+          if (g)
+            Object.assign(g, {
+              position: { x: clampedGroupX, y: clampedGroupY },
+            });
+        }
+
+        // schedule measurement for group children so overlay follows
+        scheduleMeasureForIds(childIds);
 
         return;
       }
 
-      // GROUP RESIZE branch
+      // --- GROUP RESIZE branch ---
       if (type === "resize" && isGroupId(blockId)) {
-        const group = interaction.blockSnapshot;
-        if (!group || !interaction.handle) return;
-
+        const groupSnapshot = interaction.blockSnapshot;
+        if (!groupSnapshot || !interaction.handle) return;
         const handle = interaction.handle;
         const deltaX = event.clientX - interaction.startX;
         const deltaY = event.clientY - interaction.startY;
 
-        const groupSnapshot = interaction.blockSnapshot;
         const startWidth = groupSnapshot.size?.width || 0;
         const startHeight = groupSnapshot.size?.height || 0;
         const startX = groupSnapshot.position?.x || 0;
@@ -773,156 +1000,152 @@ export default function Home() {
         // Calculate scale based on handle
         if (handle.includes("right")) {
           newGroupWidth = Math.max(40, startWidth + deltaX);
-          scaleX = newGroupWidth / startWidth;
+          scaleX = newGroupWidth / (startWidth || 1);
         }
         if (handle.includes("left")) {
           const newWidth = Math.max(40, startWidth - deltaX);
-          scaleX = newWidth / startWidth;
+          scaleX = newWidth / (startWidth || 1);
           newGroupX = startX + (startWidth - newWidth);
           newGroupWidth = newWidth;
         }
         if (handle.includes("bottom")) {
           newGroupHeight = Math.max(40, startHeight + deltaY);
-          scaleY = newGroupHeight / startHeight;
+          scaleY = newGroupHeight / (startHeight || 1);
         }
         if (handle.includes("top")) {
           const newHeight = Math.max(40, startHeight - deltaY);
-          scaleY = newHeight / startHeight;
+          scaleY = newHeight / (startHeight || 1);
           newGroupY = startY + (startHeight - newHeight);
           newGroupHeight = newHeight;
         }
 
-        // Update all child blocks proportionally
         const childSnapshots = interaction.childSnapshots || [];
         const blockOffsets = interaction.blockOffsets || {};
+        const groupBlockIds = interaction.groupBlockIds || [];
 
-        updateActivePageBlocks((prev) =>
-          prev.map((block) => {
-            if (!group.blockIds.includes(block.id)) return block;
+        // compute per-child live patches
+        groupBlockIds.forEach((bid) => {
+          const snapshot = childSnapshots.find((s) => s.id === bid) ?? null;
+          const offset = blockOffsets[bid] || { x: 0, y: 0 };
 
-            const snapshot = childSnapshots.find((s) => s.id === block.id);
-            if (!snapshot) return block;
+          if (!snapshot) return;
 
-            const offset = blockOffsets[block.id] || { x: 0, y: 0 };
+          const newOffsetX = offset.x * scaleX;
+          const newOffsetY = offset.y * scaleY;
 
-            // Scale the offset and size
-            const newOffsetX = offset.x * scaleX;
-            const newOffsetY = offset.y * scaleY;
+          const newBlockX = newGroupX + newOffsetX;
+          const newBlockY = newGroupY + newOffsetY;
 
-            const newBlockX = newGroupX + newOffsetX;
-            const newBlockY = newGroupY + newOffsetY;
+          const newSize = { ...(snapshot.size || {}) };
+          if (typeof snapshot.size?.width === "number")
+            newSize.width = snapshot.size.width * scaleX;
+          if (typeof snapshot.size?.height === "number")
+            newSize.height = snapshot.size.height * scaleY;
 
-            const newSize = { ...block.size };
-            if (typeof snapshot.size?.width === "number") {
-              newSize.width = snapshot.size.width * scaleX;
-            }
-            if (typeof snapshot.size?.height === "number") {
-              newSize.height = snapshot.size.height * scaleY;
-            }
+          let newFontSize = snapshot.fontSize;
+          // scale fontSize for text blocks
+          const blk = store.getBlockById(bid);
+          if (
+            blk &&
+            blk.type === "text" &&
+            typeof snapshot.fontSize === "number"
+          ) {
+            newFontSize = snapshot.fontSize * Math.min(scaleX, scaleY);
+          }
 
-            // Scale font size for text blocks
-            let newFontSize = block.fontSize;
-            if (
-              block.type === "text" &&
-              typeof snapshot.fontSize === "number"
-            ) {
-              newFontSize = snapshot.fontSize * Math.min(scaleX, scaleY);
-            }
+          const patch = {
+            position: { x: newBlockX, y: newBlockY },
+            size: newSize,
+          };
+          if (typeof newFontSize !== "undefined") patch.fontSize = newFontSize;
 
-            return {
-              ...block,
-              position: { x: newBlockX, y: newBlockY },
-              size: newSize,
-              fontSize: newFontSize,
-            };
-          })
-        );
+          store.updateBlock(bid, patch);
+        });
 
-        // Update group metadata
-        setGroups((prev) =>
-          prev.map((g) =>
-            g.id === blockId
-              ? {
-                  ...g,
-                  position: { x: newGroupX, y: newGroupY },
-                  size: { width: newGroupWidth, height: newGroupHeight },
-                  blockOffsets: Object.fromEntries(
-                    Object.entries(blockOffsets).map(([id, offset]) => [
-                      id,
-                      { x: offset.x * scaleX, y: offset.y * scaleY },
-                    ])
-                  ),
-                }
-              : g
-          )
-        );
+        // update group metadata (position/size/blockOffsets)
+        const newOffsets = {};
+        Object.entries(blockOffsets).forEach(([id, offset]) => {
+          newOffsets[id] = { x: offset.x * scaleX, y: offset.y * scaleY };
+        });
+
+        if (typeof store.updateGroup === "function") {
+          store.updateGroup(blockId, {
+            position: { x: newGroupX, y: newGroupY },
+            size: { width: newGroupWidth, height: newGroupHeight },
+            blockOffsets: newOffsets,
+          });
+        } else {
+          const g = store.getGroupById?.(blockId);
+          if (g)
+            Object.assign(g, {
+              position: { x: newGroupX, y: newGroupY },
+              size: { width: newGroupWidth, height: newGroupHeight },
+              blockOffsets: newOffsets,
+            });
+        }
+
+        // schedule measurement for group children so overlay follows
+        scheduleMeasureForIds(groupBlockIds);
 
         return;
       }
 
-      // GROUP CROP branch
+      // --- GROUP CROP branch ---
       if (type === "crop" && isGroupId(blockId)) {
         const group = interaction.blockSnapshot;
         if (!group || !interaction.handle) return;
-
         const handle = interaction.handle;
         const deltaX = event.clientX - interaction.startX;
         const deltaY = event.clientY - interaction.startY;
 
-        const groupSnapshot = interaction.blockSnapshot;
-        const startWidth = groupSnapshot.size?.width || 1;
-        const startHeight = groupSnapshot.size?.height || 1;
+        const startWidth = group.size?.width || 1;
+        const startHeight = group.size?.height || 1;
 
-        // Calculate crop percentages based on group dimensions
         const cropDeltaX = (deltaX / startWidth) * 100;
         const cropDeltaY = (deltaY / startHeight) * 100;
 
-        // Apply crop to all image blocks in the group
-        updateActivePageBlocks((prev) =>
-          prev.map((block) => {
-            if (!group.blockIds.includes(block.id) || block.type !== "image") {
-              return block;
-            }
+        const groupBlockIds = getGroupBlockIds(group);
 
-            const currentCrop = getCropValues(block.crop);
-            const nextCrop = { ...currentCrop };
+        groupBlockIds.forEach((bid) => {
+          const block = store.getBlockById(bid);
+          if (!block || block.type !== "image") return;
 
-            if (handle === "left") {
-              nextCrop.left = clampCropValue(currentCrop.left + cropDeltaX);
-            }
-            if (handle === "right") {
-              nextCrop.right = clampCropValue(currentCrop.right - cropDeltaX);
-            }
-            if (handle === "top") {
-              nextCrop.top = clampCropValue(currentCrop.top + cropDeltaY);
-            }
-            if (handle === "bottom") {
-              nextCrop.bottom = clampCropValue(currentCrop.bottom - cropDeltaY);
-            }
+          const currentCrop = getCropValues(block.crop);
+          const nextCrop = { ...currentCrop };
 
-            // Ensure total crop doesn't exceed 90%
-            const totalHorizontal = nextCrop.left + nextCrop.right;
-            const totalVertical = nextCrop.top + nextCrop.bottom;
+          if (handle === "left")
+            nextCrop.left = clampCropValue(currentCrop.left + cropDeltaX);
+          if (handle === "right")
+            nextCrop.right = clampCropValue(currentCrop.right - cropDeltaX);
+          if (handle === "top")
+            nextCrop.top = clampCropValue(currentCrop.top + cropDeltaY);
+          if (handle === "bottom")
+            nextCrop.bottom = clampCropValue(currentCrop.bottom - cropDeltaY);
 
-            if (totalHorizontal > 90) {
-              const scale = 90 / totalHorizontal;
-              nextCrop.left *= scale;
-              nextCrop.right *= scale;
-            }
-            if (totalVertical > 90) {
-              const scale = 90 / totalVertical;
-              nextCrop.top *= scale;
-              nextCrop.bottom *= scale;
-            }
+          // clamp totals
+          const totalHorizontal = nextCrop.left + nextCrop.right;
+          const totalVertical = nextCrop.top + nextCrop.bottom;
+          if (totalHorizontal > 90) {
+            const scale = 90 / totalHorizontal;
+            nextCrop.left *= scale;
+            nextCrop.right *= scale;
+          }
+          if (totalVertical > 90) {
+            const scale = 90 / totalVertical;
+            nextCrop.top *= scale;
+            nextCrop.bottom *= scale;
+          }
 
-            return { ...block, crop: nextCrop };
-          })
-        );
+          store.updateBlock(bid, { crop: nextCrop });
+        });
+
+        // schedule measure (group children) so overlay follows crop changes
+        scheduleMeasureForIds(groupBlockIds);
 
         return;
       }
 
-      // GROUP ROTATE branch
+      // --- GROUP ROTATE branch ---
       if (type === "rotate" && isGroupId(blockId)) {
         const group = interaction.blockSnapshot;
         if (!group) return;
@@ -934,23 +1157,20 @@ export default function Home() {
         );
         const deltaAngle = currentAngle - startAngle;
         const degrees = ((deltaAngle * 180) / Math.PI + initialRotation) % 360;
-
         const deltaRadians = deltaAngle;
         const deltaDegrees = (deltaRadians * 180) / Math.PI;
 
         const childSnapshots = interaction.childSnapshots || [];
         const groupSnapshot = interaction.blockSnapshot;
-        const groupCx = groupSnapshot.position.x + groupSnapshot.size.width / 2;
+        const groupCx =
+          groupSnapshot.position.x + (groupSnapshot.size.width / 2 || 0);
         const groupCy =
-          groupSnapshot.position.y + groupSnapshot.size.height / 2;
+          groupSnapshot.position.y + (groupSnapshot.size.height / 2 || 0);
 
-        // Pre-calculate updates
         const updates = {};
         childSnapshots.forEach((snapshot) => {
-          // 1. Update Rotation
           const newRotation = (snapshot.rotation || 0) + deltaDegrees;
 
-          // 2. Update Position
           const childWidth = snapshot.size?.width || 0;
           const childHeight = snapshot.size?.height || 0;
           const childCx = snapshot.position.x + childWidth / 2;
@@ -976,51 +1196,50 @@ export default function Home() {
           };
         });
 
-        // Apply updates to blocks
-        updateActivePageBlocks((prev) =>
-          prev.map((block) => {
-            if (updates[block.id]) {
-              return { ...block, ...updates[block.id] };
-            }
-            return block;
-          })
-        );
+        // Apply updates to the store
+        Object.entries(updates).forEach(([id, patch]) => {
+          store.updateBlock(id, patch);
+        });
 
-        // Update group metadata (rotation + offsets)
-        // We must update offsets so that subsequent moves work correctly
+        // Update group meta rotation and blockOffsets for future moves
         const newBlockOffsets = {};
         Object.entries(updates).forEach(([bid, data]) => {
           newBlockOffsets[bid] = {
-            x: data.position.x - groupSnapshot.position.x,
-            y: data.position.y - groupSnapshot.position.y,
+            x: data.position.x - (groupSnapshot.position.x || 0),
+            y: data.position.y - (groupSnapshot.position.y || 0),
           };
         });
 
-        setGroups((prev) =>
-          prev.map((g) =>
-            g.id === blockId
-              ? {
-                  ...g,
-                  rotation: degrees,
-                  blockOffsets: { ...g.blockOffsets, ...newBlockOffsets },
-                }
-              : g
-          )
-        );
+        if (typeof store.updateGroup === "function") {
+          store.updateGroup(blockId, {
+            rotation: degrees,
+            blockOffsets: {
+              ...(store.getGroupById(blockId)?.blockOffsets || {}),
+              ...newBlockOffsets,
+            },
+          });
+        } else {
+          const g = store.getGroupById?.(blockId);
+          if (g)
+            Object.assign(g, {
+              rotation: degrees,
+              blockOffsets: { ...(g.blockOffsets || {}), ...newBlockOffsets },
+            });
+        }
+
+        // schedule measurement for children so overlay follows rotation
+        scheduleMeasureForIds(Object.keys(updates));
 
         return;
       }
 
-      // --- existing single-block handlers (move / resize / crop / rotate) ---
+      // --- SINGLE BLOCK MOVE ---
       if (type === "move") {
         const deltaX = event.clientX - interaction.startX;
         const deltaY = event.clientY - interaction.startY;
 
-        // Use canvasRect that was captured at beginInteraction
-        const canvasRect =
+        const capturedCanvasRect =
           interaction.canvasRect || canvasRef.current?.getBoundingClientRect();
-
-        // Try to use a workspaceRef (preferred). If you don't have one, fallback to window dimensions.
         const workspaceRect =
           typeof workspaceRef !== "undefined" && workspaceRef.current
             ? workspaceRef.current.getBoundingClientRect()
@@ -1031,67 +1250,86 @@ export default function Home() {
                 height: window.innerHeight,
               };
 
-        updateActivePageBlocks((prev) =>
-          prev.map((block) => {
-            if (block.id !== blockId) return block;
+        const bSnap = blockSnapshot;
+        if (!bSnap) return;
 
-            // new candidate top-left in canvas-local coords
-            let nextX = blockSnapshot.position.x + deltaX;
-            let nextY = blockSnapshot.position.y + deltaY;
+        // candidate top-left
+        let nextX = (bSnap.position?.x ?? 0) + deltaX;
+        let nextY = (bSnap.position?.y ?? 0) + deltaY;
 
-            // compute effective axis-aligned size of the block (accounts for rotation)
-            const w = blockSnapshot.size?.width ?? 0;
-            const h = blockSnapshot.size?.height ?? 0;
-            const theta = ((blockSnapshot.rotation || 0) * Math.PI) / 180;
-            const c = Math.abs(Math.cos(theta));
-            const s = Math.abs(Math.sin(theta));
-            const effectiveW = Math.abs(w * c) + Math.abs(h * s);
-            const effectiveH = Math.abs(w * s) + Math.abs(h * c);
+        // effective size (rotation aware)
+        const w = bSnap.size?.width ?? 0;
+        const h = bSnap.size?.height ?? 0;
+        const theta = ((bSnap.rotation || 0) * Math.PI) / 180;
+        const c = Math.abs(Math.cos(theta));
+        const s = Math.abs(Math.sin(theta));
+        const effectiveW = Math.abs(w * c) + Math.abs(h * s);
+        const effectiveH = Math.abs(w * s) + Math.abs(h * c);
 
-            // workspaceRect.left/top are in viewport coordinates; canvasRect.left/top are too.
-            // So workspace-left-in-canvas = workspaceRect.left - canvasRect.left
-            const workspaceLeftInCanvas =
-              workspaceRect.left - (canvasRect?.left ?? 0);
-            console.log(`${canvasRect?.left ?? 0}`);
-            const workspaceTopInCanvas =
-              workspaceRect.top - (canvasRect?.top ?? 0);
-            console.log(`${canvasRect?.top ?? 0}`);
-            const workspaceRightInCanvas =
-              workspaceLeftInCanvas + workspaceRect.width;
-            const workspaceBottomInCanvas =
-              workspaceTopInCanvas + workspaceRect.height;
+        const workspaceLeftInCanvas =
+          workspaceRect.left - (capturedCanvasRect?.left ?? 0);
+        const workspaceTopInCanvas =
+          workspaceRect.top - (capturedCanvasRect?.top ?? 0);
+        const workspaceRightInCanvas =
+          workspaceLeftInCanvas + workspaceRect.width;
+        const workspaceBottomInCanvas =
+          workspaceTopInCanvas + workspaceRect.height;
 
-            // minX/minY allow some negative so user can pull the block left/top outside the canvas.
-            // maxX/maxY prevent the block's visual right/bottom from escaping the workspace.
-            const allowOutsideFactor = 0.9; // how much (fraction of width/height) allowed outside on left/top
-            const minX =
-              workspaceLeftInCanvas - effectiveW * allowOutsideFactor;
-            const minY = workspaceTopInCanvas - effectiveH * allowOutsideFactor;
+        const allowOutsideFactor = 0.9;
+        const minX = workspaceLeftInCanvas - effectiveW * allowOutsideFactor;
+        const minY = workspaceTopInCanvas - effectiveH * allowOutsideFactor;
+        const maxX = workspaceRightInCanvas - effectiveW;
+        const maxY = workspaceBottomInCanvas - effectiveH;
 
-            // For the right/bottom, we ensure the block's right/bottom (top-left + effective size)
-            // does not go beyond workspace right/bottom. So maxTopLeft = workspaceRight - effectiveSize
-            const maxX = workspaceRightInCanvas - effectiveW;
-            const maxY = workspaceBottomInCanvas - effectiveH;
+        nextX = Math.min(Math.max(nextX, minX), maxX);
+        nextY = Math.min(Math.max(nextY, minY), maxY);
 
-            // Apply clamp
-            nextX = Math.min(Math.max(nextX, minX), maxX);
-            nextY = Math.min(Math.max(nextY, minY), maxY);
+        // Live update single block
+        store.updateBlock(bSnap.id, { position: { x: nextX, y: nextY } });
 
-            return {
-              ...block,
-              position: {
-                x: nextX,
-                y: nextY,
-              },
-            };
-          })
-        );
+        // schedule measurement on next animation frame (coalesces many pointermoves)
+        if (measurementRAFRef.current)
+          cancelAnimationFrame(measurementRAFRef.current);
+        measurementRAFRef.current = requestAnimationFrame(() => {
+          try {
+            const el = store.getBlockRef(activePageId, bSnap.id);
+            if (el && typeof el.getBoundingClientRect === "function") {
+              const rect = el.getBoundingClientRect();
+              setActiveRectState(rect);
+            } else {
+              // fallback: compute from model and canvasRect (keeps overlay approx in place)
+              const canvasRectLocal =
+                canvasRef.current?.getBoundingClientRect();
+              const blk = store.getBlockById?.(bSnap.id);
+              if (canvasRectLocal && blk) {
+                setActiveRectState({
+                  left: canvasRectLocal.left + (blk.position?.x ?? 0),
+                  top: canvasRectLocal.top + (blk.position?.y ?? 0),
+                  width: blk.size?.width ?? 0,
+                  height: blk.size?.height ?? 0,
+                  right:
+                    canvasRectLocal.left +
+                    (blk.position?.x ?? 0) +
+                    (blk.size?.width ?? 0),
+                  bottom:
+                    canvasRectLocal.top +
+                    (blk.position?.y ?? 0) +
+                    (blk.size?.height ?? 0),
+                });
+              }
+            }
+          } catch (e) {
+            // ignore occasional measurement errors
+          } finally {
+            measurementRAFRef.current = null;
+          }
+        });
       }
 
+      // --- SINGLE BLOCK RESIZE ---
       if (type === "resize" && hasNumericSize(blockSnapshot)) {
         const handle = interaction.handle;
         if (!handle) return;
-
         const deltaX = event.clientX - interaction.startX;
         const deltaY = event.clientY - interaction.startY;
 
@@ -1119,26 +1357,19 @@ export default function Home() {
 
           const newFontSize = startFontSize * scale;
 
-          updateActivePageBlocks((prev) =>
-            prev.map((block) =>
-              block.id === blockId
-                ? {
-                    ...block,
-                    position: { ...block.position, x: newLeft },
-                    size: {
-                      ...(block.size || {}),
-                      width: newWidth,
-                    },
-                    fontSize: newFontSize,
-                  }
-                : block
-            )
-          );
+          store.updateBlock(blockSnapshot.id, {
+            position: { ...blockSnapshot.position, x: newLeft },
+            size: { ...(blockSnapshot.size || {}), width: newWidth },
+            fontSize: newFontSize,
+          });
+
+          // schedule measurement for the resized text block
+          scheduleMeasureForIds([blockSnapshot.id]);
 
           return;
         }
 
-        // Default resize (images, non-text, and text side handles)
+        // Default resize
         const startWidth = blockSnapshot.size.width;
         const startHeight = blockSnapshot.size.height;
         let nextWidth = startWidth;
@@ -1146,10 +1377,13 @@ export default function Home() {
         let nextX = blockSnapshot.position.x;
         let nextY = blockSnapshot.position.y;
         const minSize = 40;
+        const canvasRectLocal =
+          canvasRect || canvasRef.current?.getBoundingClientRect();
 
-        // Horizontal resize
         if (handle.includes("right")) {
-          const maxWidth = canvasRect.width - blockSnapshot.position.x;
+          const maxWidth =
+            (canvasRectLocal?.width ?? window.innerWidth) -
+            blockSnapshot.position.x;
           nextWidth = Math.max(
             minSize,
             Math.min(startWidth + deltaX, maxWidth)
@@ -1164,9 +1398,10 @@ export default function Home() {
           nextWidth = rightEdge - newLeft;
         }
 
-        // Vertical resize (non-text only)
         if (handle.includes("bottom") && typeof startHeight === "number") {
-          const maxHeight = canvasRect.height - blockSnapshot.position.y;
+          const maxHeight =
+            (canvasRectLocal?.height ?? window.innerHeight) -
+            blockSnapshot.position.y;
           nextHeight = Math.max(
             minSize,
             Math.min(startHeight + deltaY, maxHeight)
@@ -1181,26 +1416,23 @@ export default function Home() {
           nextHeight = bottomEdge - newTop;
         }
 
-        updateActivePageBlocks((prev) =>
-          prev.map((block) =>
-            block.id === blockId
-              ? {
-                  ...block,
-                  position: { x: nextX, y: nextY },
-                  size: {
-                    ...(block.size || {}),
-                    width: nextWidth,
-                    height:
-                      typeof startHeight === "number"
-                        ? nextHeight
-                        : block.size?.height,
-                  },
-                }
-              : block
-          )
-        );
+        store.updateBlock(blockSnapshot.id, {
+          position: { x: nextX, y: nextY },
+          size: {
+            ...(blockSnapshot.size || {}),
+            width: nextWidth,
+            height:
+              typeof startHeight === "number"
+                ? nextHeight
+                : blockSnapshot.size?.height,
+          },
+        });
+
+        // schedule measurement for the resized block
+        scheduleMeasureForIds([blockSnapshot.id]);
       }
 
+      // --- SINGLE BLOCK CROP (replacement) ---
       if (
         type === "crop" &&
         blockSnapshot.type === "image" &&
@@ -1209,54 +1441,106 @@ export default function Home() {
         const handle = interaction.handle;
         if (!handle) return;
 
-        const cropSnapshot = getCropValues(blockSnapshot.crop);
+        const cropSnapshot = getCropValues(blockSnapshot.crop); // left/right/top/bottom in 0..100
         const { width, height } = blockSnapshot.size;
+
         const deltaX = event.clientX - interaction.startX;
         const deltaY = event.clientY - interaction.startY;
+
         const nextCrop = { ...cropSnapshot };
 
+        // Config: how close to the edges you want to allow (visible area min)
+        const MIN_VISIBLE_PERCENT = 1; // visible width/height can be as low as 1% (tweak if too extreme)
+        const MIN_EDGE = 0; // edges may go down to 0%
+        const MAX_EDGE = 100; // edges may go up to 100%
+
+        // helper to clamp 0..100
+        const clamp100 = (v) => Math.min(Math.max(v, MIN_EDGE), MAX_EDGE);
+
+        // Convert delta -> percent of block dimension
+        const dxPercent = width > 0 ? (deltaX / width) * 100 : 0;
+        const dyPercent = height > 0 ? (deltaY / height) * 100 : 0;
+
         if (handle === "left") {
-          nextCrop.left = clampCropValue(
-            cropSnapshot.left + (deltaX / width) * 100
+          // move left crop inward when dragging right (dxPercent positive)
+          nextCrop.left = clamp100(cropSnapshot.left + dxPercent);
+          // enforce minimum visible width: left + right <= 100 - MIN_VISIBLE_PERCENT
+          nextCrop.left = Math.min(
+            nextCrop.left,
+            100 - cropSnapshot.right - MIN_VISIBLE_PERCENT
           );
         }
+
         if (handle === "right") {
-          nextCrop.right = clampCropValue(
-            cropSnapshot.right - (deltaX / width) * 100
+          // moving right handle: dragging right should decrease right crop, dragging left increases it
+          // original code used (cropSnapshot.right - dxPercent) — we mirror that but clamp clearly
+          nextCrop.right = clamp100(cropSnapshot.right - dxPercent);
+          nextCrop.right = Math.min(
+            nextCrop.right,
+            100 - cropSnapshot.left - MIN_VISIBLE_PERCENT
           );
         }
+
         if (handle === "top") {
-          nextCrop.top = clampCropValue(
-            cropSnapshot.top + (deltaY / height) * 100
+          nextCrop.top = clamp100(cropSnapshot.top + dyPercent);
+          nextCrop.top = Math.min(
+            nextCrop.top,
+            100 - cropSnapshot.bottom - MIN_VISIBLE_PERCENT
           );
         }
+
         if (handle === "bottom") {
-          nextCrop.bottom = clampCropValue(
-            cropSnapshot.bottom - (deltaY / height) * 100
+          nextCrop.bottom = clamp100(cropSnapshot.bottom - dyPercent);
+          nextCrop.bottom = Math.min(
+            nextCrop.bottom,
+            100 - cropSnapshot.top - MIN_VISIBLE_PERCENT
           );
         }
 
-        const totalHorizontal = nextCrop.left + nextCrop.right;
-        const totalVertical = nextCrop.top + nextCrop.bottom;
+        // Final safety: make sure no edge exceeds MAX_EDGE and visible span >= MIN_VISIBLE_PERCENT
+        nextCrop.left = clamp100(nextCrop.left);
+        nextCrop.right = clamp100(nextCrop.right);
+        nextCrop.top = clamp100(nextCrop.top);
+        nextCrop.bottom = clamp100(nextCrop.bottom);
 
-        if (totalHorizontal > 90) {
-          const scale = 90 / totalHorizontal;
-          nextCrop.left *= scale;
-          nextCrop.right *= scale;
-        }
-        if (totalVertical > 90) {
-          const scale = 90 / totalVertical;
-          nextCrop.top *= scale;
-          nextCrop.bottom *= scale;
+        // If numerical drift makes visible < MIN_VISIBLE_PERCENT, nudge the moving edge back.
+        const visibleH = 100 - (nextCrop.left + nextCrop.right);
+        if (visibleH < MIN_VISIBLE_PERCENT) {
+          // nudge the edge that changed this move (prefer to adjust the handle side)
+          if (handle === "left") {
+            nextCrop.left = 100 - nextCrop.right - MIN_VISIBLE_PERCENT;
+          } else if (handle === "right") {
+            nextCrop.right = 100 - nextCrop.left - MIN_VISIBLE_PERCENT;
+          } else {
+            // fallback: scale both
+            const excess = MIN_VISIBLE_PERCENT - visibleH;
+            // distribute small correction
+            nextCrop.left = clamp100(nextCrop.left - excess / 2);
+            nextCrop.right = clamp100(nextCrop.right - excess / 2);
+          }
         }
 
-        updateActivePageBlocks((prev) =>
-          prev.map((block) =>
-            block.id === blockId ? { ...block, crop: nextCrop } : block
-          )
-        );
+        const visibleV = 100 - (nextCrop.top + nextCrop.bottom);
+        if (visibleV < MIN_VISIBLE_PERCENT) {
+          if (handle === "top") {
+            nextCrop.top = 100 - nextCrop.bottom - MIN_VISIBLE_PERCENT;
+          } else if (handle === "bottom") {
+            nextCrop.bottom = 100 - nextCrop.top - MIN_VISIBLE_PERCENT;
+          } else {
+            const excess = MIN_VISIBLE_PERCENT - visibleV;
+            nextCrop.top = clamp100(nextCrop.top - excess / 2);
+            nextCrop.bottom = clamp100(nextCrop.bottom - excess / 2);
+          }
+        }
+
+        // commit live
+        store.updateBlock(blockSnapshot.id, { crop: nextCrop });
+
+        // keep overlay in sync
+        scheduleMeasureForIds([blockSnapshot.id]);
       }
 
+      // --- SINGLE BLOCK ROTATE ---
       if (type === "rotate" && hasNumericSize(blockSnapshot)) {
         const { center, startAngle, initialRotation } = interaction;
         const currentAngle = Math.atan2(
@@ -1266,26 +1550,225 @@ export default function Home() {
         const deltaAngle = currentAngle - startAngle;
         const degrees = ((deltaAngle * 180) / Math.PI + initialRotation) % 360;
 
-        updateActivePageBlocks((prev) =>
-          prev.map((block) =>
-            block.id === blockId
-              ? {
-                  ...block,
-                  rotation: Number.isFinite(degrees) ? degrees : 0,
-                }
-              : block
-          )
-        );
+        store.updateBlock(blockSnapshot.id, {
+          rotation: Number.isFinite(degrees) ? degrees : 0,
+        });
+
+        // schedule measurement for rotation
+        scheduleMeasureForIds([blockSnapshot.id]);
       }
     },
-    [updateActivePageBlocks, setGroups]
+    // dependencies: include anything used inside (store, refs, helpers)
+    [
+      store,
+      canvasRef,
+      workspaceRef,
+      isGroupId,
+      getCropValues,
+      clampCropValue,
+      hasNumericSize,
+      activePageId,
+      measurementRAFRef,
+    ]
   );
 
+  // create single stable function objects once (same identity)
+  const onDocPointerMove = useRef((event) => {
+    // call latest handler if present
+    if (handlePointerMoveRef.current) handlePointerMoveRef.current(event);
+  }).current;
+
+  const onDocPointerUp = useRef((event) => {
+    if (endInteractionRef.current) endInteractionRef.current(event);
+  }).current;
+
   const endInteraction = useCallback(() => {
-    document.removeEventListener("pointermove", handlePointerMove);
-    document.removeEventListener("pointerup", endInteraction);
-    interactionRef.current = null;
-  }, [handlePointerMove]);
+    // remove listeners first
+    document.removeEventListener("pointermove", onDocPointerMove);
+    document.removeEventListener("pointerup", onDocPointerUp);
+
+    const interaction = interactionRef.current;
+    if (!interaction) {
+      interactionRef.current = null;
+      return;
+    }
+
+    const { type, blockId, blockSnapshot, groupSnapshot, childSnapshots } =
+      interaction;
+
+    try {
+      // ---------- GROUP finalization (atomic) ----------
+      if (isGroupId(blockId)) {
+        // groupBefore: prefer groupSnapshot captured in beginInteraction
+        const groupBefore =
+          groupSnapshot ??
+          interaction.blockSnapshot ??
+          store.getGroupById?.(blockId) ??
+          null;
+        // groupAfter: current group stored in the store
+        const groupAfter = store.getGroupById?.(blockId) ?? null;
+
+        // build child before map from captured snapshots (interaction.childSnapshots)
+        const childBefore = {};
+        (childSnapshots || []).forEach((s) => {
+          childBefore[s.id] = {
+            position: s.position ? { ...s.position } : undefined,
+            rotation:
+              typeof s.rotation !== "undefined" ? s.rotation : undefined,
+            size: s.size ? { ...s.size } : undefined,
+            fontSize:
+              typeof s.fontSize !== "undefined" ? s.fontSize : undefined,
+          };
+        });
+
+        // build child after map by reading current store blocks (use groupAfter.childIds if available)
+        const childIds =
+          groupAfter?.childIds &&
+          Array.isArray(groupAfter.childIds) &&
+          groupAfter.childIds.length
+            ? groupAfter.childIds
+            : interaction.groupBlockIds || Object.keys(childBefore);
+
+        const childAfter = {};
+        childIds.forEach((cid) => {
+          const b = store.getBlockById(cid);
+          if (!b) return;
+          childAfter[cid] = {
+            position: b.position ? { ...b.position } : undefined,
+            rotation:
+              typeof b.rotation !== "undefined" ? b.rotation : undefined,
+            size: b.size ? { ...b.size } : undefined,
+            fontSize:
+              typeof b.fontSize !== "undefined" ? b.fontSize : undefined,
+          };
+        });
+
+        // Only apply if something actually changed
+        const beforeStr = JSON.stringify({
+          group: groupBefore,
+          children: childBefore,
+        });
+        const afterStr = JSON.stringify({
+          group: groupAfter,
+          children: childAfter,
+        });
+        if (beforeStr !== afterStr) {
+          store.applyCommand(
+            GroupTransformCommand(
+              blockId,
+              groupBefore,
+              groupAfter,
+              childBefore,
+              childAfter
+            )
+          );
+        }
+
+        interactionRef.current = null;
+        return;
+      }
+
+      // ---------- SINGLE BLOCK finalization ----------
+      if (!blockSnapshot) {
+        interactionRef.current = null;
+        return;
+      }
+
+      const blockIdFinal = blockSnapshot.id;
+      const current = store.getBlockById(blockIdFinal);
+
+      if (type === "move") {
+        if (current && blockSnapshot.position) {
+          const beforePos = { ...blockSnapshot.position };
+          const afterPos = current.position ? { ...current.position } : null;
+          if (
+            afterPos &&
+            (beforePos.x !== afterPos.x || beforePos.y !== afterPos.y)
+          ) {
+            store.applyCommand(MoveCommand(blockIdFinal, beforePos, afterPos));
+          }
+        }
+      } else if (type === "resize") {
+        if (current) {
+          const beforeSize = blockSnapshot.size
+            ? { ...blockSnapshot.size }
+            : null;
+          const afterSize = current.size ? { ...current.size } : null;
+          const beforePos = blockSnapshot.position
+            ? { ...blockSnapshot.position }
+            : null;
+          const afterPos = current.position ? { ...current.position } : null;
+          const beforeFont =
+            typeof blockSnapshot.fontSize !== "undefined"
+              ? blockSnapshot.fontSize
+              : null;
+          const afterFont =
+            typeof current.fontSize !== "undefined" ? current.fontSize : null;
+
+          // Only push if something changed
+          if (
+            JSON.stringify(beforeSize) !== JSON.stringify(afterSize) ||
+            JSON.stringify(beforePos) !== JSON.stringify(afterPos) ||
+            beforeFont !== afterFont
+          ) {
+            store.applyCommand(
+              ResizeCommand({
+                blockId: blockIdFinal,
+                oldSize: beforeSize,
+                newSize: afterSize,
+                oldPos: beforePos,
+                newPos: afterPos,
+                oldFontSize: beforeFont,
+                newFontSize: afterFont,
+              })
+            );
+          }
+        }
+      } else if (type === "rotate") {
+        if (current) {
+          const beforeRot =
+            typeof blockSnapshot.rotation !== "undefined"
+              ? blockSnapshot.rotation
+              : 0;
+          const afterRot =
+            typeof current.rotation !== "undefined" ? current.rotation : 0;
+          if (beforeRot !== afterRot) {
+            store.applyCommand(
+              RotateCommand({
+                blockId: blockIdFinal,
+                oldRotation: beforeRot,
+                newRotation: afterRot,
+              })
+            );
+          }
+        }
+      } else if (type === "crop") {
+        if (current) {
+          const beforeCrop = blockSnapshot.crop
+            ? { ...blockSnapshot.crop }
+            : {};
+          const afterCrop = current.crop ? { ...current.crop } : {};
+          if (JSON.stringify(beforeCrop) !== JSON.stringify(afterCrop)) {
+            store.applyCommand(
+              CropCommand(blockIdFinal, beforeCrop, afterCrop)
+            );
+          }
+        }
+      }
+    } catch (err) {
+      console.error("endInteraction: finalize failed", err);
+    } finally {
+      interactionRef.current = null;
+    }
+  }, [
+    handlePointerMove,
+    store,
+    MoveCommand,
+    ResizeCommand,
+    RotateCommand,
+    CropCommand,
+    GroupTransformCommand,
+  ]);
 
   const handleChangeCanvasBackground = useCallback((color) => {
     setCanvasBackground(color);
@@ -1293,28 +1776,113 @@ export default function Home() {
 
   const toggleTextFormatForSelection = useCallback(
     (patchFn) => {
-      if (!selectedIds || selectedIds.length === 0) return;
+      if (typeof patchFn !== "function") return;
 
-      // If single selection is a group, apply to text blocks inside the group
-      if (selectedIds.length === 1 && isGroupId(selectedIds[0])) {
-        const gid = selectedIds[0];
-        const group = getGroupById(gid);
-        if (!group) return;
-        updateActivePageBlocks((prev) =>
-          prev.map((b) =>
-            group.blockIds.includes(b.id) && b.type === "text" ? patchFn(b) : b
-          )
-        );
-        return;
+      // Resolve selection (prefer selectedIds, fallback to activeId)
+      const selIds =
+        selectedIds && selectedIds.length
+          ? selectedIds.slice()
+          : activeId
+          ? [activeId]
+          : [];
+
+      if (selIds.length === 0) return;
+
+      // If single selection is a group, expand to group's child ids
+      let targetIds = selIds;
+      if (selIds.length === 1 && isGroupId(selIds[0])) {
+        const g = store.getGroupById?.(selIds[0]);
+        if (!g) return;
+        targetIds =
+          Array.isArray(g.childIds) && g.childIds.length
+            ? g.childIds.slice()
+            : Array.isArray(g.blockIds) && g.blockIds.length
+            ? g.blockIds.slice()
+            : [];
       }
 
-      updateActivePageBlocks((prev) =>
-        prev.map((b) =>
-          selectedIds.includes(b.id) && b.type === "text" ? patchFn(b) : b
-        )
-      );
+      // Filter to existing text blocks
+      const textIds = targetIds.filter((id) => {
+        const b = store.getBlockById?.(id);
+        return b && b.type === "text";
+      });
+
+      if (textIds.length === 0) return;
+
+      // Build old/new patches per block
+      const oldMap = {}; // id -> oldPatch
+      const newMap = {}; // id -> newPatch
+
+      textIds.forEach((id) => {
+        const b = store.getBlockById(id);
+        if (!b) return;
+
+        // Clone minimal block for patchFn to avoid mutating store object
+        const before = JSON.parse(JSON.stringify(b));
+        const after = patchFn(JSON.parse(JSON.stringify(b))) || {};
+
+        // compute shallow diff: keys that changed or newly added/removed
+        const diffNew = {};
+        const diffOld = {};
+
+        // consider keys in union of before and after
+        const keys = Array.from(
+          new Set([...Object.keys(before), ...Object.keys(after)])
+        );
+        keys.forEach((k) => {
+          const valBefore = before[k];
+          const valAfter = after[k];
+
+          // simple deep-equality for objects/arrays via JSON stringify (sufficient for our POJOs)
+          const same = (() => {
+            if (typeof valBefore === "object" || typeof valAfter === "object") {
+              try {
+                return JSON.stringify(valBefore) === JSON.stringify(valAfter);
+              } catch {
+                return valBefore === valAfter;
+              }
+            }
+            return valBefore === valAfter;
+          })();
+
+          if (!same) {
+            diffNew[k] = valAfter;
+            diffOld[k] = typeof valBefore === "undefined" ? null : valBefore;
+          }
+        });
+
+        // Only include if there's an actual change
+        if (Object.keys(diffNew).length > 0) {
+          oldMap[id] = diffOld;
+          newMap[id] = diffNew;
+        }
+      });
+
+      // If nothing changed, bail
+      if (Object.keys(newMap).length === 0) return;
+
+      // Apply live updates
+      Object.entries(newMap).forEach(([id, patch]) => {
+        store.updateBlock(id, patch);
+      });
+
+      // Create a single compound command for undo/redo
+      const cmd = {
+        do(s) {
+          Object.entries(newMap).forEach(([id, patch]) =>
+            s.updateBlock(id, patch)
+          );
+        },
+        undo(s) {
+          Object.entries(oldMap).forEach(([id, patch]) =>
+            s.updateBlock(id, patch)
+          );
+        },
+      };
+
+      store.applyCommand(cmd);
     },
-    [selectedIds, groups, updateActivePageBlocks]
+    [store, selectedIds, activeId, isGroupId]
   );
 
   // Toggle bold
@@ -1340,88 +1908,141 @@ export default function Home() {
   // FONT SIZE handler — safe replacement
   const handleChangeFontSize = useCallback(
     (size) => {
-      if (!size) return;
+      if (typeof size === "undefined" || size === null) return;
 
-      // prefer current selection; fallback to activeId (single selection)
+      // determine selection
       const selIds =
         selectedIds && selectedIds.length
-          ? selectedIds
+          ? selectedIds.slice()
           : activeId
           ? [activeId]
           : [];
 
       if (selIds.length === 0) return;
 
-      // If single selection is a group, apply to text blocks inside the group
+      // expand group -> text children if single selection is a group
+      let targetIds = selIds;
       if (selIds.length === 1 && isGroupId(selIds[0])) {
-        const gid = selIds[0];
-        const group = getGroupById(gid);
-        if (!group) return;
-        updateActivePageBlocks((prev) =>
-          prev.map((b) =>
-            group.blockIds.includes(b.id) && b.type === "text"
-              ? { ...b, fontSize: size }
-              : b
-          )
-        );
-        return;
+        const g = store.getGroupById?.(selIds[0]);
+        if (!g) return;
+        targetIds = (g.childIds || []).slice();
       }
 
-      // Apply to all selected text blocks
-      updateActivePageBlocks((prev) =>
-        prev.map((b) =>
-          selIds.includes(b.id) && b.type === "text"
-            ? { ...b, fontSize: size }
-            : b
-        )
-      );
+      // filter to existing text blocks
+      const textIds = targetIds.filter((id) => {
+        const b = store.getBlockById(id);
+        return b && b.type === "text";
+      });
+
+      if (textIds.length === 0) return;
+
+      // build old/new maps
+      const oldMap = {};
+      const newMap = {};
+      textIds.forEach((id) => {
+        const b = store.getBlockById(id);
+        oldMap[id] = {
+          fontSize: typeof b.fontSize !== "undefined" ? b.fontSize : null,
+        };
+        newMap[id] = { fontSize: size };
+      });
+
+      // Apply live update
+      textIds.forEach((id) => store.updateBlock(id, { fontSize: size }));
+
+      // Create a single compound command (do/undo)
+      const cmd = {
+        do(s) {
+          Object.entries(newMap).forEach(([id, patch]) =>
+            s.updateBlock(id, patch)
+          );
+        },
+        undo(s) {
+          Object.entries(oldMap).forEach(([id, patch]) =>
+            s.updateBlock(id, patch)
+          );
+        },
+      };
+
+      store.applyCommand(cmd);
     },
-    [selectedIds, activeId, updateActivePageBlocks, groups]
+    [store, selectedIds, activeId, isGroupId]
   );
 
   // ---------- Text color handler (for selected text blocks) ----------
   const handleChangeTextColor = useCallback(
     (color) => {
-      if (!selectedIds || selectedIds.length === 0) return;
+      if (!color) return;
 
-      // If a single selection and it's a group, apply to text blocks inside the group.
-      if (selectedIds.length === 1 && isGroupId(selectedIds[0])) {
-        const gid = selectedIds[0];
-        const group = getGroupById(gid);
-        if (!group) return;
+      // determine selection
+      const selIds =
+        selectedIds && selectedIds.length
+          ? selectedIds.slice()
+          : activeId
+          ? [activeId]
+          : [];
 
-        updateActivePageBlocks((prev) =>
-          prev.map((b) =>
-            group.blockIds.includes(b.id) && b.type === "text"
-              ? { ...b, color }
-              : b
-          )
-        );
+      if (selIds.length === 0) return;
 
-        return;
+      // if a single selection and it's a group, expand to group's text children
+      let targetIds = selIds;
+      if (selIds.length === 1 && isGroupId(selIds[0])) {
+        const g = store.getGroupById?.(selIds[0]);
+        if (!g) return;
+        targetIds = (g.childIds || []).slice();
       }
 
-      // Otherwise apply to all selected block ids that are text blocks
-      updateActivePageBlocks((prev) =>
-        prev.map((b) =>
-          selectedIds.includes(b.id) && b.type === "text" ? { ...b, color } : b
-        )
-      );
+      // filter to existing text blocks
+      const textIds = targetIds.filter((id) => {
+        const b = store.getBlockById(id);
+        return b && b.type === "text";
+      });
+
+      if (textIds.length === 0) return;
+
+      // build old/new maps
+      const oldMap = {};
+      const newMap = {};
+      textIds.forEach((id) => {
+        const b = store.getBlockById(id);
+        oldMap[id] = { color: typeof b.color !== "undefined" ? b.color : null };
+        newMap[id] = { color };
+      });
+
+      // Apply live update
+      textIds.forEach((id) => store.updateBlock(id, { color }));
+
+      // Compound command for undo/redo
+      const cmd = {
+        do(s) {
+          Object.entries(newMap).forEach(([id, patch]) =>
+            s.updateBlock(id, patch)
+          );
+        },
+        undo(s) {
+          Object.entries(oldMap).forEach(([id, patch]) =>
+            s.updateBlock(id, patch)
+          );
+        },
+      };
+
+      store.applyCommand(cmd);
     },
-    [selectedIds, updateActivePageBlocks, groups]
+    [store, selectedIds, activeId, isGroupId]
   );
 
   const createTextBlock = useCallback(() => {
     const genId = (prefix = "b") =>
       `${prefix}-${Date.now()}-${Math.floor(Math.random() * 100000)}`;
 
-    // compute a sensible default position:
-    // If there's a currently selected block use its center; otherwise place in canvas center.
     const canvasRect = canvasRef.current?.getBoundingClientRect();
-    const defaultX = (canvasRect?.width ?? 800) / 2 - 120; // left so it's centered visually
+    const defaultX = (canvasRect?.width ?? 800) / 2 - 120;
     const defaultY = (canvasRect?.height ?? 600) / 2 - 24;
 
     const newId = genId("b");
+    const highestZ =
+      (store.blocks || []).reduce((m, b) => Math.max(m, b.zIndex ?? 0), 0) || 0;
+
     const newBlock = {
       id: newId,
       type: "text",
@@ -1433,24 +2054,22 @@ export default function Home() {
       rotation: 0,
       fontSize: 16,
       color: "#111827",
-      zIndex:
-        (activeBlocks.reduce((m, b) => Math.max(m, b.zIndex ?? 0), 0) || 0) + 1,
+      zIndex: highestZ + 1,
       locked: false,
     };
-    snapshot();
-    updateActivePageBlocks((prev) => [...prev, newBlock]);
+
+    // Apply add-block as an undoable command
+    store.applyCommand(
+      AddBlockCommand({ pageId: store.activePageId, createdBlock: newBlock })
+    );
+
+    // update selection and active id locally
     setSelectedIds([newId]);
     setActiveId(newId);
 
-    // If you use groups or overlay, ensure selection shows toolbar immediately:
-    // setTimeout(() => { /* optional slight delay to ensure overlay updates */ }, 0);
-  }, [
-    canvasRef,
-    updateActivePageBlocks,
-    setSelectedIds,
-    setActiveId,
-    activeBlocks,
-  ]);
+    // optionally open text edit / focus
+    // setEditingBlockId(newId);
+  }, [canvasRef, store, setSelectedIds, setActiveId]);
 
   const currentBackground = (() => {
     if (!selectedIds || selectedIds.length === 0) return "";
@@ -1482,21 +2101,60 @@ export default function Home() {
       const canvasRect = canvasRef.current?.getBoundingClientRect();
       if (!canvasRect) return;
 
-      snapshot();
-
-      // If blockId is a group id, we snapshot all children so we can move them together
-      // inside beginInteraction (group branch)
+      // If group
       if (isGroupId(blockId)) {
-        const g = getGroupById(blockId);
+        const g = store.getGroupById?.(blockId);
         if (!g) return;
 
-        // snapshot children (we still keep child snapshots for safety)
-        const childSnapshots = g.blockIds
+        // normalize child ids (support both childIds and blockIds)
+        const groupBlockIds = Array.isArray(g.childIds)
+          ? [...g.childIds]
+          : Array.isArray(g.blockIds)
+          ? [...g.blockIds]
+          : [];
+
+        // child snapshots from store
+        const childSnapshots = groupBlockIds
           .map((bid) => {
-            const b = activeBlocks.find((bb) => bb.id === bid);
-            return b ? JSON.parse(JSON.stringify(b)) : null;
+            const b = store.getBlockById(bid);
+            if (!b) return null;
+            return {
+              id: b.id,
+              position: b.position ? { ...b.position } : { x: 0, y: 0 },
+              size: b.size ? { ...b.size } : { width: 0, height: 0 },
+              rotation: typeof b.rotation !== "undefined" ? b.rotation : 0,
+              fontSize:
+                typeof b.fontSize !== "undefined" ? b.fontSize : undefined,
+            };
           })
           .filter(Boolean);
+
+        // blockOffsets may be stored on group; otherwise compute from block positions
+        const storedOffsets =
+          g.blockOffsets && typeof g.blockOffsets === "object"
+            ? { ...g.blockOffsets }
+            : {};
+
+        const computedOffsets = {};
+        if (!Object.keys(storedOffsets).length) {
+          const groupPos = g.position || { x: 0, y: 0 };
+          groupBlockIds.forEach((bid) => {
+            const b = store.getBlockById(bid);
+            if (!b) return;
+            computedOffsets[bid] = {
+              x: (b.position?.x ?? 0) - (groupPos.x ?? 0),
+              y: (b.position?.y ?? 0) - (groupPos.y ?? 0),
+            };
+          });
+        }
+
+        const blockOffsets =
+          Object.keys(storedOffsets).length > 0
+            ? storedOffsets
+            : computedOffsets;
+
+        // deep clone group snapshot using JSON to avoid undefined deepClone helper
+        const clonedGroup = JSON.parse(JSON.stringify(g));
 
         const payload = {
           type,
@@ -1504,24 +2162,28 @@ export default function Home() {
           startX: event.clientX,
           startY: event.clientY,
           canvasRect,
-          blockSnapshot: { ...g }, // group snapshot
-          groupBlockIds: [...g.blockIds],
+          // provide both blockSnapshot and groupSnapshot (downstream code may read either)
+          blockSnapshot: clonedGroup,
+          groupSnapshot: clonedGroup,
+          groupSnapshotPosition: clonedGroup.position
+            ? { ...clonedGroup.position }
+            : { x: 0, y: 0 },
+          groupBlockIds,
           childSnapshots,
-          // the offsets we need to recompute positions exactly
-          blockOffsets: { ...(g.blockOffsets || {}) },
-          groupSnapshotPosition: { ...(g.position || { x: 0, y: 0 }) },
+          blockOffsets,
           ...options,
         };
 
+        // rotation helper for group
         if (type === "rotate") {
-          const blockSnapshot = payload.blockSnapshot;
-          const blockWidth = blockSnapshot.size.width;
-          const blockHeight = blockSnapshot.size.height ?? 0;
+          const blockSnapshot = payload.groupSnapshot;
+          const blockWidth = blockSnapshot.size?.width ?? 0;
+          const blockHeight = blockSnapshot.size?.height ?? 0;
 
           const centerX =
-            canvasRect.left + blockSnapshot.position.x + blockWidth / 2;
+            canvasRect.left + (blockSnapshot.position?.x ?? 0) + blockWidth / 2;
           const centerY =
-            canvasRect.top + blockSnapshot.position.y + blockHeight / 2;
+            canvasRect.top + (blockSnapshot.position?.y ?? 0) + blockHeight / 2;
 
           payload.center = { x: centerX, y: centerY };
           payload.startAngle = Math.atan2(
@@ -1533,16 +2195,17 @@ export default function Home() {
 
         interactionRef.current = payload;
         setActiveId(blockId);
-        document.addEventListener("pointermove", handlePointerMove);
-        document.addEventListener("pointerup", endInteraction);
+        document.addEventListener("pointermove", onDocPointerMove);
+        document.addEventListener("pointerup", onDocPointerUp);
         return;
       }
 
-      // single-block case (existing logic)
-      const blockSnapshot = activeBlocks.find((block) => block.id === blockId);
-      if (!blockSnapshot) return;
+      // --- single block ---
+      const b = store.getBlockById(blockId);
+      if (!b) return;
 
-      if (blockSnapshot.locked) {
+      // if locked, just focus/select and bail
+      if (b.locked) {
         setActiveId(blockId);
         setEditingBlockId(null);
         return;
@@ -1557,32 +2220,48 @@ export default function Home() {
         startX: event.clientX,
         startY: event.clientY,
         canvasRect,
-        blockSnapshot: JSON.parse(JSON.stringify(blockSnapshot)),
+        blockSnapshot: {
+          id: b.id,
+          position: b.position ? { ...b.position } : { x: 0, y: 0 },
+          size: b.size ? { ...b.size } : { width: 0, height: 0 },
+          rotation: typeof b.rotation !== "undefined" ? b.rotation : 0,
+          fontSize: typeof b.fontSize !== "undefined" ? b.fontSize : undefined,
+          // keep other useful props if needed
+          type: b.type,
+          crop: b.crop ? { ...b.crop } : undefined,
+        },
         ...options,
       };
 
-      if (type === "rotate" && hasNumericSize(blockSnapshot)) {
-        const blockWidth = blockSnapshot.size.width;
-        const blockHeight = blockSnapshot.size.height ?? 0;
+      // rotation helper for single block
+      if (type === "rotate" && hasNumericSize(b)) {
+        const blockWidth = b.size.width;
+        const blockHeight = b.size.height ?? 0;
 
-        const centerX =
-          canvasRect.left + blockSnapshot.position.x + blockWidth / 2;
-        const centerY =
-          canvasRect.top + blockSnapshot.position.y + blockHeight / 2;
+        const centerX = canvasRect.left + (b.position?.x ?? 0) + blockWidth / 2;
+        const centerY = canvasRect.top + (b.position?.y ?? 0) + blockHeight / 2;
 
         payload.center = { x: centerX, y: centerY };
         payload.startAngle = Math.atan2(
           event.clientY - centerY,
           event.clientX - centerX
         );
-        payload.initialRotation = blockSnapshot.rotation ?? 0;
+        payload.initialRotation = b.rotation ?? 0;
       }
 
       interactionRef.current = payload;
-      document.addEventListener("pointermove", handlePointerMove);
-      document.addEventListener("pointerup", endInteraction);
+      document.addEventListener("pointermove", onDocPointerMove);
+      document.addEventListener("pointerup", onDocPointerUp);
     },
-    [activeBlocks, handlePointerMove, endInteraction, groups, getGroupById]
+    [
+      store,
+      isGroupId,
+      handlePointerMove,
+      endInteraction,
+      setActiveId,
+      setEditingBlockId,
+      hasNumericSize,
+    ]
   );
 
   // -------------------------
@@ -1590,18 +2269,33 @@ export default function Home() {
   // -------------------------
   const handleBlockPointerDown = useCallback(
     (event, block) => {
+      // If we are already editing this text block, don't start selection/move
       if (block.type === "text" && editingBlockId === block.id) {
         event.stopPropagation();
         return;
       }
 
+      // Read authoritative block from store (in case local prop is stale)
+      const freshBlock = store.getBlockById
+        ? store.getBlockById(block.id)
+        : block;
+      if (!freshBlock) {
+        // fallback to passed block if store doesn't have it for some reason
+        // but still continue with same logic
+      }
+
       // multi-select modifier
       const multi = event.shiftKey || event.metaKey || event.ctrlKey;
 
-      // If block is in a group, select the group instead
-      const targetId = block.groupId || block.id;
+      // If block is inside a group, target the group id; otherwise use the block id
+      const targetId =
+        freshBlock && freshBlock.groupId
+          ? freshBlock.groupId
+          : block.groupId ?? block.id;
 
-      if (block.locked) {
+      // If block (or the block object clicked) is locked, just toggle/select without starting drag
+      const locked = freshBlock?.locked ?? block.locked;
+      if (locked) {
         event.stopPropagation();
         if (multi) {
           setSelectedIds((prev) =>
@@ -1617,8 +2311,8 @@ export default function Home() {
         return;
       }
 
+      // Multi-select toggle behaviour (do not start dragging)
       if (multi) {
-        // toggle membership only, don't start dragging
         event.stopPropagation();
         setSelectedIds((prev) =>
           prev.includes(targetId)
@@ -1630,12 +2324,18 @@ export default function Home() {
         return;
       }
 
-      // single select & begin move
-      // set selection to this single id and start moving
+      // Single select + begin move
       setSelectedIds([targetId]);
       beginInteraction(event, "move", targetId);
     },
-    [beginInteraction, editingBlockId]
+    [
+      store,
+      beginInteraction,
+      editingBlockId,
+      setSelectedIds,
+      setActiveId,
+      setEditingBlockId,
+    ]
   );
 
   // -------------------------
@@ -1643,214 +2343,406 @@ export default function Home() {
   // -------------------------
   const handleDeleteActive = useCallback(() => {
     if (!activeId) return;
-    snapshot();
+
+    // If activeId is group
     if (isGroupId(activeId)) {
-      const group = groups.find((g) => g.id === activeId);
+      const group = store.getGroupById?.(activeId);
       if (!group) return;
-      // delete group members
-      updateActivePageBlocks((prev) =>
-        prev.filter((b) => !group.blockIds.includes(b.id))
-      );
-      // remove group meta
-      setGroups((prev) => prev.filter((g) => g.id !== activeId));
+
+      // Capture full snapshots of the group and its blocks so we can undo exactly
+      const groupSnapshot = JSON.parse(JSON.stringify(group));
+      const page =
+        store.findPageContainingBlock?.(group.childIds?.[0]) ||
+        store.activePage;
+      const blockSnapshots = [];
+      // capture each block and its index within the page
+      (group.childIds || []).forEach((bid) => {
+        const b = store.getBlockById(bid);
+        if (!b) return;
+        const idx = page ? page.blocks.findIndex((blk) => blk.id === bid) : -1;
+        blockSnapshots.push({
+          block: JSON.parse(JSON.stringify(b)),
+          index: idx,
+        });
+      });
+
+      // create a single compound command (do/undo) for group deletion
+      const cmd = {
+        do(s) {
+          // remove all blocks (in descending index order to keep indices consistent)
+          const sorted = blockSnapshots
+            .slice()
+            .sort((a, b) => (b.index ?? -1) - (a.index ?? -1));
+          sorted.forEach((bs) => {
+            if (bs.block && bs.block.id) {
+              const pageContaining =
+                s.findPageContainingBlock?.(bs.block.id) || s.activePage;
+              if (pageContaining) {
+                pageContaining.blocks = (pageContaining.blocks || []).filter(
+                  (blk) => blk.id !== bs.block.id
+                );
+              }
+            }
+          });
+
+          // remove group meta
+          if (typeof s.removeGroup === "function") {
+            s.removeGroup(activeId);
+          } else {
+            // fallback: remove from s.groups
+            s.groups = (s.groups || []).filter((g) => g.id !== activeId);
+          }
+        },
+        undo(s) {
+          // restore blocks at their original indices
+          const pid = page?.id ?? s.activePageId;
+          const targetPage =
+            s.project.pages.find((p) => p.id === pid) || s.activePage;
+          if (!targetPage) return;
+
+          const blocksCopy = targetPage.blocks ? targetPage.blocks.slice() : [];
+          // insert each block at recorded index (if valid) else push
+          blockSnapshots.forEach((bs) => {
+            if (!bs.block) return;
+            const idx =
+              typeof bs.index === "number" &&
+              bs.index >= 0 &&
+              bs.index <= blocksCopy.length
+                ? bs.index
+                : blocksCopy.length;
+            // avoid duplicates
+            if (!blocksCopy.some((b) => b.id === bs.block.id)) {
+              blocksCopy.splice(idx, 0, bs.block);
+            }
+          });
+          targetPage.blocks = blocksCopy;
+
+          // restore group meta
+          if (typeof s.addGroup === "function") {
+            s.addGroup(groupSnapshot);
+          } else {
+            s.groups = [...(s.groups || []), groupSnapshot];
+          }
+        },
+      };
+
+      // apply compound command
+      store.applyCommand(cmd);
+
+      // clear selection / UI state
       setSelectedIds([]);
       setActiveId(null);
       setEditingBlockId(null);
       setIsPositionPanelOpen(false);
+
       return;
     }
 
-    updateActivePageBlocks((prev) =>
-      prev.filter((block) => block.id !== activeId)
-    );
+    // Single block delete (undoable via existing command)
+    // prefer using DeleteBlockCommand factory to keep undo behavior consistent
+    const toDeleteId = activeId;
+    store.applyCommand(DeleteBlockCommand(toDeleteId));
+
+    // clear UI selection state
     setActiveId(null);
     setEditingBlockId(null);
     setIsPositionPanelOpen(false);
-  }, [activeId, groups, updateActivePageBlocks]);
+  }, [
+    activeId,
+    store,
+    setSelectedIds,
+    setActiveId,
+    setEditingBlockId,
+    setIsPositionPanelOpen,
+  ]);
 
   const handleToggleLock = useCallback(
     (blockId) => {
-      updateActivePageBlocks((prev) =>
-        prev.map((block) =>
-          block.id === blockId ? { ...block, locked: !block.locked } : block
-        )
-      );
+      const b = store.getBlockById?.(blockId);
+      if (!b) {
+        // Nothing to toggle
+        return;
+      }
+
+      const oldLocked = !!b.locked;
+      const newLocked = !oldLocked;
+
+      // apply undoable command
+      store.applyCommand(LockUnlockCommand(blockId, oldLocked, newLocked));
     },
-    [updateActivePageBlocks]
+    [store]
   );
 
   // Duplicate single block or group
   const handleDuplicateBlock = useCallback(
     (id) => {
-      snapshot();
-      // duplicate group
+      if (!id) return;
+
+      // DUPLICATE GROUP
       if (isGroupId(id)) {
-        const group = getGroupById(id);
+        const group = store.getGroupById?.(id);
         if (!group) return;
 
-        const newGroupId = `g-${Date.now()}-${Math.floor(
-          Math.random() * 1000
-        )}`;
+        // normalize child ids key (support either childIds or blockIds)
+        const originalChildIds = getGroupBlockIds(group);
+
+        if (originalChildIds.length === 0) return;
+
         const offset = 16;
+        const newGroupId = `g-${Date.now()}-${Math.floor(
+          Math.random() * 100000
+        )}`;
+
+        // Build copies and new offsets
+        const copies = [];
         const newBlockIds = [];
-        const newBlockOffsets = {}; // Store new offsets
+        const newBlockOffsets = {};
 
-        const copies = group.blockIds
-          .map((bid) => {
-            const original = activeBlocks.find((b) => b.id === bid);
-            if (!original) return null;
+        // determine active page to insert into
+        const page =
+          store.findPageContainingBlock?.(originalChildIds[0]) ||
+          store.activePage;
+        const pageId = page?.id ?? store.activePageId;
 
-            // Generate a unique ID for the new block
-            const newId = `${original.id}-${Date.now()}-${Math.floor(
-              Math.random() * 1000
-            )}`;
-            newBlockIds.push(newId);
+        // compute current max zIndex on that page
+        const pageBlocks = page?.blocks ?? [];
+        const maxZ = pageBlocks.reduce((m, b) => Math.max(m, b.zIndex ?? 0), 0);
 
-            // Copy the offset from the original group using the original ID
-            if (group.blockOffsets && group.blockOffsets[bid]) {
-              newBlockOffsets[newId] = { ...group.blockOffsets[bid] };
+        originalChildIds.forEach((origId, idx) => {
+          const orig = store.getBlockById(origId);
+          if (!orig) return;
+
+          const newId = `${orig.id}-${Date.now()}-${Math.floor(
+            Math.random() * 100000
+          )}`;
+          newBlockIds.push(newId);
+
+          // copy offset if group has offsets keyed by original id
+          const origOffsets = group.blockOffsets ?? group.blockOffsets ?? {};
+          if (origOffsets && origOffsets[origId]) {
+            newBlockOffsets[newId] = { ...origOffsets[origId] };
+          }
+
+          const copy = JSON.parse(JSON.stringify(orig));
+          copy.id = newId;
+          // assign to new group
+          // our store uses childIds for group membership, but blocks keep groupId field
+          copy.groupId = newGroupId;
+          // offset position slightly so duplicates don't overlap exactly
+          copy.position = {
+            x: (orig.position?.x ?? 0) + offset,
+            y: (orig.position?.y ?? 0) + offset,
+          };
+          copy.zIndex = (orig.zIndex ?? maxZ) + 1 + idx; // keep stacking order
+          copies.push(copy);
+        });
+
+        // create new group meta based on original (deep-cloned)
+        const groupMeta = JSON.parse(JSON.stringify(group));
+        groupMeta.id = newGroupId;
+        // childIds key is used by store; support both
+        if ("childIds" in groupMeta) groupMeta.childIds = newBlockIds;
+        if ("blockIds" in groupMeta) groupMeta.blockIds = newBlockIds;
+        groupMeta.blockOffsets = newBlockOffsets;
+        groupMeta.position = {
+          x: (group.position?.x ?? 0) + offset,
+          y: (group.position?.y ?? 0) + offset,
+        };
+
+        // Compound command: add all blocks and add group; undo removes them.
+        const cmd = {
+          do(s) {
+            // append copies to the target page
+            const p =
+              s.project.pages.find((pg) => pg.id === pageId) || s.activePage;
+            if (!p) return;
+            p.blocks = [
+              ...(p.blocks || []),
+              ...JSON.parse(JSON.stringify(copies)),
+            ];
+
+            // add group meta to store
+            if (typeof s.addGroup === "function") {
+              // normalize to store's preferred childIds field
+              const gm = { ...groupMeta };
+              if (!gm.childIds && gm.blockIds) gm.childIds = gm.blockIds;
+              s.addGroup(gm);
+            } else {
+              s.groups = [...(s.groups || []), groupMeta];
             }
+          },
+          undo(s) {
+            // remove the created blocks
+            const p =
+              s.project.pages.find((pg) => pg.id === pageId) || s.activePage;
+            if (!p) return;
+            p.blocks = (p.blocks || []).filter(
+              (b) => !newBlockIds.includes(b.id)
+            );
 
-            return {
-              ...JSON.parse(JSON.stringify(original)),
-              id: newId,
-              groupId: newGroupId, // Assign to the new group
-              position: {
-                x: (original.position.x ?? 0) + offset,
-                y: (original.position.y ?? 0) + offset,
-              },
-              zIndex: (original.zIndex ?? 0) + 1,
-            };
-          })
-          .filter(Boolean);
-
-        const newGroup = {
-          ...JSON.parse(JSON.stringify(group)),
-          id: newGroupId,
-          blockIds: newBlockIds,
-          blockOffsets: newBlockOffsets, // Assign the new offsets
-          position: {
-            x: (group.position.x ?? 0) + offset,
-            y: (group.position.y ?? 0) + offset,
+            // remove group meta
+            if (typeof s.removeGroup === "function") {
+              s.removeGroup(newGroupId);
+            } else {
+              s.groups = (s.groups || []).filter((g) => g.id !== newGroupId);
+            }
           },
         };
 
-        updateActivePageBlocks((prev) => [...prev, ...copies]);
-        setGroups((prev) => [...prev, newGroup]);
+        store.applyCommand(cmd);
 
-        // Select the new group
+        // select new group
         setSelectedIds([newGroupId]);
         setActiveId(newGroupId);
         return;
       }
 
-      // duplicate single block
-      updateActivePageBlocks((prev) => {
-        const target = prev.find((b) => b.id === id);
-        if (!target) return prev;
+      // DUPLICATE SINGLE BLOCK (undoable using DuplicateCommand with createdBlock)
+      const orig = store.getBlockById(id);
+      if (!orig) return;
 
-        const maxZ = prev.reduce((max, b) => Math.max(max, b.zIndex ?? 0), 0);
+      // find page containing the block
+      const page = store.findPageContainingBlock?.(id) || store.activePage;
+      const pageId = page?.id ?? store.activePageId;
 
-        const newId = `${id}-${Date.now()}-${Math.floor(Math.random() * 1000)}`;
+      const offset = 16;
+      const newId = `${id}-${Date.now()}-${Math.floor(Math.random() * 100000)}`;
+      const maxZ = (page?.blocks ?? []).reduce(
+        (m, b) => Math.max(m, b.zIndex ?? 0),
+        0
+      );
 
-        const offset = 16;
+      const newBlock = JSON.parse(JSON.stringify(orig));
+      newBlock.id = newId;
+      newBlock.locked = false;
+      newBlock.position = {
+        x: (orig.position?.x ?? 0) + offset,
+        y: (orig.position?.y ?? 0) + offset,
+      };
+      newBlock.zIndex = (orig.zIndex ?? maxZ) + 1;
 
-        const newBlock = {
-          ...target,
-          id: newId,
-          locked: false,
-          position: {
-            x: (target.position?.x ?? 0) + offset,
-            y: (target.position?.y ?? 0) + offset,
-          },
-          zIndex: maxZ + 1,
-        };
+      // use DuplicateCommand factory with createdBlock to make this undoable as one command
+      store.applyCommand(DuplicateCommand({ pageId, createdBlock: newBlock }));
 
-        return [...prev, newBlock];
-      });
+      // select new block
+      setSelectedIds([newId]);
+      setActiveId(newId);
     },
-    [activeBlocks, groups, updateActivePageBlocks]
+    [store, isGroupId, setSelectedIds, setActiveId]
   );
 
   // -------------------------
   // Selection helpers
   // -------------------------
-  const handleSelectLayer = useCallback((id) => {
-    setActiveId(id);
-    setEditingBlockId(null);
-    setSelectedIds([id]);
-  }, []);
+  // select a layer (UI selection only)
+  const handleSelectLayer = useCallback(
+    (id) => {
+      setActiveId(id);
+      setEditingBlockId(null);
+      setSelectedIds([id]);
+    },
+    [setActiveId, setEditingBlockId, setSelectedIds]
+  );
 
-  // Cycle text align / list (unchanged)
+  // cycle text align
   const handleCycleTextAlign = useCallback(() => {
     if (!activeId) return;
-    updateActivePageBlocks((prev) =>
-      prev.map((b) => {
-        if (b.id !== activeId) return b;
-        const current = b.textAlign || "center";
-        const idx = ALIGN_ORDER.indexOf(current);
-        const next = ALIGN_ORDER[(idx + 1) % ALIGN_ORDER.length];
-        return { ...b, textAlign: next };
-      })
-    );
-  }, [activeId]);
 
+    const b = store.getBlockById?.(activeId);
+    if (!b || b.type !== "text") return;
+
+    const current = b.textAlign || "center";
+    const idx = ALIGN_ORDER.indexOf(current);
+    const next = ALIGN_ORDER[(idx + 1) % ALIGN_ORDER.length];
+
+    // no-op guard
+    if (next === current) return;
+
+    // live update for immediate UI feedback
+    store.updateBlock(activeId, { textAlign: next });
+
+    // push undoable command (oldPatch / newPatch)
+    const oldPatch = { textAlign: current };
+    const newPatch = { textAlign: next };
+    store.applyCommand(TextChangeCommand(activeId, oldPatch, newPatch));
+  }, [activeId, store]);
+
+  // cycle list type
   const handleCycleListType = useCallback(() => {
     if (!activeId) return;
-    updateActivePageBlocks((prev) =>
-      prev.map((b) => {
-        if (b.id !== activeId) return b;
-        const current = b.listType || "normal";
-        const idx = LIST_ORDER.indexOf(current);
-        const next = LIST_ORDER[(idx + 1) % LIST_ORDER.length];
-        return { ...b, listType: next };
-      })
-    );
-  }, [activeId]);
+
+    const b = store.getBlockById?.(activeId);
+    if (!b || b.type !== "text") return;
+
+    const current = b.listType || "normal";
+    const idx = LIST_ORDER.indexOf(current);
+    const next = LIST_ORDER[(idx + 1) % LIST_ORDER.length];
+
+    if (next === current) return;
+
+    // live update
+    store.updateBlock(activeId, { listType: next });
+
+    // push undoable command
+    const oldPatch = { listType: current };
+    const newPatch = { listType: next };
+    store.applyCommand(TextChangeCommand(activeId, oldPatch, newPatch));
+  }, [activeId, store]);
 
   // -------------------------
   // Grouping: create / ungroup
   // -------------------------
-  function computeGroupBBox(blockIds) {
-    // prefer DOM rects
-    const rects = blockIds
-      .map((id) => getBlockRef(activePageId, id))
-      .filter(Boolean)
-      .map((el) => el.getBoundingClientRect());
+  const computeGroupBBox = useCallback(
+    (blockIds) => {
+      if (!blockIds || blockIds.length === 0) return null;
 
-    if (rects.length > 0) {
-      const left = Math.min(...rects.map((r) => r.left));
-      const top = Math.min(...rects.map((r) => r.top));
-      const right = Math.max(...rects.map((r) => r.right));
-      const bottom = Math.max(...rects.map((r) => r.bottom));
+      // 1️⃣ Prefer DOM rects (accurate even with rotation)
+      const rects = blockIds
+        .map((id) => store.getBlockRef(store.activePageId, id))
+        .filter(Boolean)
+        .map((el) => el.getBoundingClientRect());
+
+      if (rects.length > 0) {
+        const left = Math.min(...rects.map((r) => r.left));
+        const top = Math.min(...rects.map((r) => r.top));
+        const right = Math.max(...rects.map((r) => r.right));
+        const bottom = Math.max(...rects.map((r) => r.bottom));
+
+        return {
+          left,
+          top,
+          width: right - left,
+          height: bottom - top,
+          viewport: true, // values are viewport-based
+        };
+      }
+
+      // 2️⃣ Fallback: use store blocks (canvas-local coords)
+      const chosen = blockIds
+        .map((id) => store.getBlockById(id))
+        .filter(Boolean);
+
+      if (chosen.length === 0) return null;
+
+      const leftPx = Math.min(...chosen.map((b) => b.position.x));
+      const topPx = Math.min(...chosen.map((b) => b.position.y));
+      const rightPx = Math.max(
+        ...chosen.map((b) => b.position.x + (b.size?.width || 0))
+      );
+      const bottomPx = Math.max(
+        ...chosen.map((b) => b.position.y + (b.size?.height || 0))
+      );
+
       return {
-        left,
-        top,
-        width: right - left,
-        height: bottom - top,
-        viewport: true,
+        left: leftPx,
+        top: topPx,
+        width: rightPx - leftPx,
+        height: bottomPx - topPx,
+        viewport: false, // values are canvas-local
       };
-    }
-
-    // fallback to canvas positions
-    const chosen = activeBlocks.filter((b) => blockIds.includes(b.id));
-    if (chosen.length === 0) return null;
-    const leftPx = Math.min(...chosen.map((b) => b.position.x));
-    const topPx = Math.min(...chosen.map((b) => b.position.y));
-    const rightPx = Math.max(
-      ...chosen.map((b) => b.position.x + (b.size?.width || 0))
-    );
-    const bottomPx = Math.max(
-      ...chosen.map((b) => b.position.y + (b.size?.height || 0))
-    );
-    return {
-      left: leftPx,
-      top: topPx,
-      width: rightPx - leftPx,
-      height: bottomPx - topPx,
-      viewport: false,
-    };
-  }
+    },
+    [store, store.getBlockRef]
+  );
 
   //create group
   const handleCreateGroup = useCallback(() => {
@@ -1876,71 +2768,226 @@ export default function Home() {
       position.y = bbox.top;
     }
 
+    // calculate page / target for z-index decisions
+    const page =
+      store.findPageContainingBlock?.(blockIds[0]) || store.activePage;
+    const pageBlocks = page?.blocks ?? [];
+
+    // capture original z-index map for each child (used by undo and by ungroup)
+    const originalZ = {};
+    blockIds.forEach((bid) => {
+      const b = store.getBlockById(bid);
+      originalZ[bid] = typeof b?.zIndex === "number" ? b.zIndex : 0;
+    });
+
+    // compute new z indices so this group's children appear on top (contiguous)
+    const globalMaxZ =
+      pageBlocks.reduce((m, b) => Math.max(m, b.zIndex ?? 0), 0) || 0;
+    let nextZ = globalMaxZ + 1;
+    const newZMap = {};
+    // preserve the original internal stacking order by sorting by original z
+    const orderedChildIds = blockIds
+      .slice()
+      .sort((a, b) => (originalZ[a] ?? 0) - (originalZ[b] ?? 0));
+    orderedChildIds.forEach((id) => {
+      newZMap[id] = nextZ++;
+    });
+
+    const groupId = `g-${Date.now()}-${Math.floor(Math.random() * 100000)}`;
+
+    const groupMeta = {
+      id: groupId,
+      blockIds: blockIds.slice(),
+      childIds: blockIds.slice(),
+      position,
+      size,
+      rotation: 0,
+      blockOffsets: {}, // will compute below
+      meta: {
+        originalZ, // store original z map for later ungroup restore
+      },
+    };
+
     // compute offsets of each block relative to group position (canvas-local)
     const blockOffsets = {};
     blockIds.forEach((bid) => {
-      const b = activeBlocks.find((bb) => bb.id === bid);
+      const b = store.getBlockById(bid);
       if (!b) return;
-      // offset based on block.position (canvas-local)
       blockOffsets[bid] = {
         x: (b.position?.x ?? 0) - position.x,
         y: (b.position?.y ?? 0) - position.y,
       };
     });
+    groupMeta.blockOffsets = blockOffsets;
 
-    const groupId = `g-${Date.now()}-${Math.floor(Math.random() * 1000)}`;
-    const groupMeta = {
-      id: groupId,
-      blockIds,
-      position,
-      size,
-      rotation: 0,
-      blockOffsets,
+    // Build compound command: set zIndices & group meta atomically
+    const cmd = {
+      do(s) {
+        // 1) set each block.groupId and new zIndex
+        Object.entries(newZMap).forEach(([bid, z]) => {
+          s.updateBlock(bid, { groupId: groupId, zIndex: z });
+        });
+
+        // 2) add group meta to the store
+        if (typeof s.addGroup === "function") {
+          // normalize to childIds preferred by store
+          const gm = { ...groupMeta };
+          if (!gm.childIds && gm.blockIds) gm.childIds = gm.blockIds;
+          s.addGroup(gm);
+        } else {
+          s.groups = [
+            ...(s.groups || []),
+            JSON.parse(JSON.stringify(groupMeta)),
+          ];
+        }
+      },
+      undo(s) {
+        // 1) remove group meta
+        if (typeof s.removeGroup === "function") {
+          s.removeGroup(groupId);
+        } else {
+          s.groups = (s.groups || []).filter((g) => g.id !== groupId);
+        }
+
+        // 2) restore original zIndex and clear groupId
+        Object.entries(originalZ).forEach(([bid, z]) => {
+          // only restore if block still exists
+          const blk = s.getBlockById?.(bid);
+          if (blk) {
+            s.updateBlock(bid, { zIndex: z, groupId: undefined });
+          }
+        });
+      },
     };
-    snapshot();
-    // assign groupId to blocks (we don't change individual positions here)
-    updateActivePageBlocks((prev) =>
-      prev.map((b) => (blockIds.includes(b.id) ? { ...b, groupId } : b))
-    );
-    setGroups((prev) => [...prev, groupMeta]);
 
-    // select the new group
+    store.applyCommand(cmd);
+
+    // update selection to the new group
     setSelectedIds([groupId]);
     setActiveId(groupId);
-  }, [selectedIds, activeBlocks, getBlockRef]);
+  }, [
+    selectedIds,
+    store,
+    canvasRef,
+    computeGroupBBox,
+    setSelectedIds,
+    setActiveId,
+    isGroupId,
+  ]);
 
   const handleUngroup = useCallback(
     (groupIdArg) => {
-      const groupId = groupIdArg || selectedIds.find(isGroupId);
+      const groupId = groupIdArg || (selectedIds || []).find(isGroupId);
       if (!groupId) return;
-      snapshot();
-      setGroups((prev) => prev.filter((g) => g.id !== groupId));
-      updateActivePageBlocks((prev) =>
-        prev.map((b) =>
-          b.groupId === groupId ? { ...b, groupId: undefined } : b
-        )
-      );
 
-      // After ungroup, select the former members (best UX)
-      const group = groups.find((g) => g.id === groupId);
-      const members = group?.blockIds ?? [];
-      setSelectedIds(members.length ? members : []);
-      setActiveId(members.length ? members[0] : null);
+      const group = store.getGroupById?.(groupId);
+      if (!group) return;
+
+      // derive member ids
+      const members =
+        Array.isArray(group.childIds) && group.childIds.length
+          ? group.childIds.slice()
+          : Array.isArray(group.blockIds)
+          ? group.blockIds.slice()
+          : [];
+
+      // capture whatever we need for undo: group snapshot and current block snapshots
+      const groupSnapshot = JSON.parse(JSON.stringify(group));
+      const blockSnapshots = members
+        .map((bid) => {
+          const b = store.getBlockById(bid);
+          return b
+            ? { id: bid, snapshot: JSON.parse(JSON.stringify(b)) }
+            : null;
+        })
+        .filter(Boolean);
+
+      // try to get originalZ map from group.meta.originalZ (if exists)
+      const savedOriginalZ =
+        group.meta && typeof group.meta === "object" && group.meta.originalZ
+          ? { ...group.meta.originalZ }
+          : null;
+
+      const cmd = {
+        do(s) {
+          // 1) remove group meta
+          if (typeof s.removeGroup === "function") {
+            s.removeGroup(groupId);
+          } else {
+            s.groups = (s.groups || []).filter((g) => g.id !== groupId);
+          }
+
+          // 2) clear groupId for members and restore z if savedOriginalZ present
+          members.forEach((bid) => {
+            const blk = s.getBlockById?.(bid);
+            if (!blk) return;
+            const toPatch = { groupId: undefined };
+            if (savedOriginalZ && typeof savedOriginalZ[bid] !== "undefined") {
+              toPatch.zIndex = savedOriginalZ[bid];
+            }
+            s.updateBlock(bid, toPatch);
+          });
+        },
+        undo(s) {
+          // restore group meta
+          if (typeof s.addGroup === "function") {
+            // ensure we add the same snapshot back (childIds normalized)
+            const gm = { ...groupSnapshot };
+            if (!gm.childIds && gm.blockIds) gm.childIds = gm.blockIds;
+            s.addGroup(gm);
+          } else {
+            s.groups = [
+              ...(s.groups || []),
+              JSON.parse(JSON.stringify(groupSnapshot)),
+            ];
+          }
+
+          // restore each block snapshot (zIndex, position, groupId etc.)
+          blockSnapshots.forEach((bs) => {
+            const snap = bs.snapshot;
+            const patch = {};
+            if (typeof snap.zIndex !== "undefined") patch.zIndex = snap.zIndex;
+            if (typeof snap.groupId !== "undefined")
+              patch.groupId = snap.groupId;
+            // restore other fields as needed (here we restore z and groupId)
+            s.updateBlock(bs.id, patch);
+          });
+        },
+      };
+
+      store.applyCommand(cmd);
+
+      // update selection: select former members (UX)
+      if (members.length > 0) {
+        setSelectedIds(members);
+        setActiveId(members[0]);
+      } else {
+        setSelectedIds([]);
+        setActiveId(null);
+      }
     },
-    [selectedIds, groups, updateActivePageBlocks]
+    [selectedIds, store, setSelectedIds, setActiveId, isGroupId]
   );
 
   // -------------------------
   // Arrange / align / keyboard shortcuts
   // -------------------------
+  // Keyboard shortcuts: Group (Ctrl/Cmd+G), Ungroup (Ctrl/Cmd+Shift+G), Escape to clear selection
   useEffect(() => {
     const onKeyDown = (e) => {
       // group: Ctrl/Cmd+G, ungroup: Ctrl/Cmd+Shift+G
       if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "g") {
         e.preventDefault();
         if (e.shiftKey) {
-          // ungroup
-          const gid = selectedIds.find(isGroupId);
+          // ungroup: prefer group id from selectedIds, fallback to store
+          const gid =
+            (selectedIds || []).find(isGroupId) ||
+            (() => {
+              // fallback: if selection is a child, find its group in store
+              const firstSel = (selectedIds || [])[0];
+              const b = firstSel ? store.getBlockById?.(firstSel) : null;
+              return b?.groupId ?? null;
+            })();
           if (gid) handleUngroup(gid);
         } else {
           // group
@@ -1953,84 +3000,286 @@ export default function Home() {
         setActiveId(null);
       }
     };
+
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
-  }, [selectedIds, handleCreateGroup, handleUngroup]);
+  }, [selectedIds, handleCreateGroup, handleUngroup, store, isGroupId]);
 
-  // -------------------------
-  // cleanup pointer listeners (existing)
-  // -------------------------
+  // Cleanup pointer listeners on unmount or handler change
   useEffect(() => {
     return () => {
-      document.removeEventListener("pointermove", handlePointerMove);
-      document.removeEventListener("pointerup", endInteraction);
+      document.removeEventListener("pointermove", onDocPointerMove);
+      document.removeEventListener("pointerup", onDocPointerUp);
+      if (measurementRAFRef.current)
+        cancelAnimationFrame(measurementRAFRef.current);
     };
-  }, [handlePointerMove, endInteraction]);
+  }, [onDocPointerMove, onDocPointerUp]);
 
   // -------------------------
   // Compute layers for PositionPanel
   // -------------------------
   const layers = [
-    ...activeBlocks.filter((b) => !b.groupId),
-    ...groups.map((g) => ({
-      ...g,
-      type: "group",
-      // Use max zIndex of children for sorting
-      zIndex: Math.max(
-        ...g.blockIds.map(
-          (bid) => activeBlocks.find((b) => b.id === bid)?.zIndex ?? 0
-        ),
-        0
-      ),
-    })),
+    // blocks that are not part of a group
+    ...(store.blocks || []).filter((b) => !b.groupId),
+    // groups represented as layer entries
+    ...(store.groups || []).map((g) => {
+      // compute max zIndex among children (safe fallback 0)
+      const maxZ =
+        (g.childIds || g.blockIds || [])
+          .map((bid) => store.getBlockById?.(bid)?.zIndex ?? 0)
+          .reduce((m, z) => Math.max(m, z), 0) || 0;
+
+      return {
+        ...g,
+        type: "group",
+        zIndex: maxZ,
+      };
+    }),
   ];
 
-  // -------------------------
-  // Render
-  // -------------------------
+  const handleArrange = useCallback(
+    (action) => {
+      // pick selection (prefer selectedIds, fall back to activeId)
+      const targets = (
+        selectedIds && selectedIds.length > 0
+          ? selectedIds.slice()
+          : activeId
+          ? [activeId]
+          : []
+      ).filter(Boolean);
+      if (!targets.length) return;
+
+      const page = store.activePage;
+      if (!page || !page.blocks) return;
+
+      // order block ids by current zIndex (asc)
+      const ordered = (page.blocks || [])
+        .slice()
+        .sort((a, b) => (a.zIndex ?? 0) - (b.zIndex ?? 0))
+        .map((b) => b.id);
+
+      // new ordering (we'll mutate a copy)
+      const newOrder = ordered.slice();
+
+      // helper to move id to index
+      const moveToIndex = (id, index) => {
+        const i = newOrder.indexOf(id);
+        if (i === -1) return;
+        newOrder.splice(i, 1);
+        newOrder.splice(index, 0, id);
+      };
+
+      // perform requested action
+      if (action === "forward" || action === "backward") {
+        // iterate targets in reasonable order:
+        // forward: iterate from end->start so multiple targets behave predictably
+        // backward: iterate from start->end
+        const iter = action === "forward" ? [...targets].reverse() : targets;
+        iter.forEach((tid) => {
+          const idx = newOrder.indexOf(tid);
+          if (idx === -1) return;
+          if (action === "forward" && idx < newOrder.length - 1) {
+            // swap with next
+            const tmp = newOrder[idx + 1];
+            newOrder[idx + 1] = tid;
+            newOrder[idx] = tmp;
+          } else if (action === "backward" && idx > 0) {
+            const tmp = newOrder[idx - 1];
+            newOrder[idx - 1] = tid;
+            newOrder[idx] = tmp;
+          }
+        });
+      } else if (action === "front") {
+        // move targets to end (top)
+        targets.forEach((tid) => moveToIndex(tid, newOrder.length));
+      } else if (action === "back") {
+        // move targets to start (bottom) preserving relative order
+        // place them in same relative order as targets array
+        targets.forEach((tid, i) => moveToIndex(tid, i));
+      } else {
+        return;
+      }
+
+      // Build oldMap and newMap for changed ids (only commit changed z's)
+      const oldMap = {};
+      const newMap = {};
+      // new z index = position index (0..n-1)
+      newOrder.forEach((id, idx) => {
+        const block = page.blocks.find((b) => b.id === id);
+        const oldZ = block?.zIndex ?? idx;
+        if (oldMap[id] === undefined) oldMap[id] = oldZ;
+        const newZ = idx;
+        if (oldZ !== newZ) newMap[id] = newZ;
+      });
+
+      // if nothing changed, do nothing
+      if (Object.keys(newMap).length === 0) return;
+
+      // apply undoable command (ZIndexCommand is already in your commands)
+      store.applyCommand(ZIndexCommand(oldMap, newMap));
+
+      // optional UI housekeeping
+      setIsPositionPanelOpen(false);
+      // keep selection as-is
+    },
+    [selectedIds, activeId, store, setIsPositionPanelOpen]
+  );
+
+  // --- Align to page handler ---
+  const handleAlign = useCallback(
+    (dir) => {
+      const targets = (
+        selectedIds && selectedIds.length > 0
+          ? selectedIds.slice()
+          : activeId
+          ? [activeId]
+          : []
+      ).filter(Boolean);
+      if (!targets.length) return;
+
+      const canvasEl = canvasRef.current;
+      if (!canvasEl) return;
+      const canvasRect = canvasEl.getBoundingClientRect();
+
+      const oldPositions = {};
+      const newPatches = {};
+
+      targets.forEach((id) => {
+        const block =
+          store.getBlockById?.(id) ||
+          (store.blocks || []).find((b) => b.id === id);
+        if (!block) return;
+
+        // determine width/height of block: prefer DOM for accurate clipped/cropped sizes
+        let bw = block.size?.width ?? 0;
+        let bh = block.size?.height ?? 0;
+        const dom = store.getBlockRef?.(store.activePageId, id);
+        if (dom && dom.getBoundingClientRect) {
+          const r = dom.getBoundingClientRect();
+          // r.width/r.height are rendered box sizes; convert to "canvas-local" coords:
+          // if your canvas is not scaled, can use r.width/r.height directly.
+          bw = r.width;
+          bh = r.height;
+        } else {
+          // If size is stored in px in the block, keep it; if percent etc., this will be approximate.
+          if (typeof bw === "string" && bw.endsWith("px"))
+            bw = Number(bw.replace("px", "")) || 0;
+          if (typeof bh === "string" && bh.endsWith("px"))
+            bh = Number(bh.replace("px", "")) || 0;
+        }
+
+        // current position
+        const oldPos = block.position || { x: 0, y: 0 };
+        oldPositions[id] = { ...(oldPos || {}) };
+
+        // compute new x,y relative to canvas top-left
+        let nx = oldPos.x ?? 0;
+        let ny = oldPos.y ?? 0;
+
+        if (dir === "top") {
+          ny = 0;
+        } else if (dir === "middle") {
+          ny = Math.round((canvasRect.height - bh) / 2);
+        } else if (dir === "bottom") {
+          ny = Math.round(canvasRect.height - bh);
+        } else if (dir === "left") {
+          nx = 0;
+        } else if (dir === "center") {
+          nx = Math.round((canvasRect.width - bw) / 2);
+        } else if (dir === "right") {
+          nx = Math.round(canvasRect.width - bw);
+        } else {
+          return;
+        }
+
+        newPatches[id] = {
+          position: { x: Math.max(0, nx), y: Math.max(0, ny) },
+        };
+      });
+
+      // prepare undoable command: record oldPositions -> newPatches
+      const cmd = {
+        do(s) {
+          Object.entries(newPatches).forEach(([id, patch]) => {
+            s.updateBlock(id, patch);
+          });
+        },
+        undo(s) {
+          Object.entries(oldPositions).forEach(([id, pos]) => {
+            s.updateBlock(id, { position: pos });
+          });
+        },
+      };
+
+      store.applyCommand(cmd);
+
+      // keep panel open or close as you prefer
+      setIsPositionPanelOpen(false);
+    },
+    [selectedIds, activeId, store, canvasRef, setIsPositionPanelOpen]
+  );
+
   // -------------------------
   // Reorder layers (PositionPanel)
   // -------------------------
   const handleReorderLayers = useCallback(
     (newOrderedIds) => {
-      // newOrderedIds is [TopLayerId, ..., BottomLayerId]
-      // We process from bottom to top to assign increasing zIndex
+      if (!Array.isArray(newOrderedIds) || newOrderedIds.length === 0) return;
+
+      // Build maps of old zIndices for all affected blocks (so undo can restore)
+      const oldMap = {};
+      (store.blocks || []).forEach((b) => {
+        if (b && b.id) oldMap[b.id] = b.zIndex ?? 0;
+      });
+
+      // We'll assign z indices from bottom (lowest) to top (highest)
       const reversedIds = [...newOrderedIds].reverse();
       let currentZ = 1;
 
-      updateActivePageBlocks((prev) => {
-        const nextBlocks = [...prev];
+      // Build newMap for blocks changed, and apply live updates
+      const newMap = {}; // blockId => newZ
 
-        reversedIds.forEach((layerId) => {
-          if (isGroupId(layerId)) {
-            const group = groups.find((g) => g.id === layerId);
-            if (group) {
-              // Sort children by existing zIndex to keep internal order
-              const children = nextBlocks.filter((b) =>
-                group.blockIds.includes(b.id)
-              );
-              children.sort((a, b) => (a.zIndex ?? 0) - (b.zIndex ?? 0));
+      reversedIds.forEach((layerId) => {
+        if (isGroupId(layerId)) {
+          // group: raise all children in internal order
+          const group = store.getGroupById?.(layerId);
+          if (!group) return;
+          const childIds = getGroupBlockIds(group);
 
-              children.forEach((child) => {
-                const idx = nextBlocks.findIndex((b) => b.id === child.id);
-                if (idx !== -1) {
-                  nextBlocks[idx] = { ...nextBlocks[idx], zIndex: currentZ++ };
-                }
-              });
-            }
-          } else {
-            const idx = nextBlocks.findIndex((b) => b.id === layerId);
-            if (idx !== -1) {
-              nextBlocks[idx] = { ...nextBlocks[idx], zIndex: currentZ++ };
-            }
-          }
-        });
+          // sort children by prior zIndex so visual stacking inside group stays consistent
+          childIds.sort((a, b) => (oldMap[a] ?? 0) - (oldMap[b] ?? 0));
 
-        return nextBlocks;
+          childIds.forEach((cid) => {
+            newMap[cid] = currentZ++;
+          });
+        } else {
+          // single block id
+          newMap[layerId] = currentZ++;
+        }
       });
+
+      // Apply live updates to store so UI re-renders immediately
+      Object.entries(newMap).forEach(([id, z]) => {
+        const blk = store.getBlockById?.(id);
+        if (blk) {
+          store.updateBlock(id, { zIndex: z });
+        }
+      });
+
+      // Push a single undoable command that can restore old z-indices
+      store.applyCommand(ZIndexCommand(oldMap, newMap));
     },
-    [groups, updateActivePageBlocks]
+    [store, isGroupId]
   );
+
+  // keep refs up to date with latest callbacks
+  useEffect(() => {
+    handlePointerMoveRef.current = handlePointerMove;
+  }, [handlePointerMove]);
+
+  useEffect(() => {
+    endInteractionRef.current = endInteraction;
+  }, [endInteraction]);
 
   return (
     <div
@@ -2065,75 +3314,138 @@ export default function Home() {
             visible
             x={toolbarCoords.helperX}
             y={toolbarCoords.helperY}
-            locked={!!(activeBlock && activeBlock.locked)}
+            locked={
+              !!(() => {
+                // compute locked state for the active block/group (safe read)
+                if (!activeId) return false;
+                if (isGroupId(activeId)) {
+                  const g = store.getGroupById?.(activeId);
+                  return !!g?.locked;
+                }
+                const b = store.getBlockById?.(activeId);
+                return !!b?.locked;
+              })()
+            }
             onLock={() => {
-              const sel = selectedIds.length
-                ? selectedIds
-                : activeBlock
-                ? [activeBlock.id]
-                : [];
+              // determine selection (selectedIds preferred, fallback to activeBlock)
+              const sel =
+                selectedIds && selectedIds.length
+                  ? selectedIds.slice()
+                  : activeId
+                  ? [activeId]
+                  : [];
 
               const firstId = sel[0];
               if (!firstId) return;
 
+              // determine current locked state (if first is group read group.locked; else block.locked)
               let currentlyLocked = false;
               if (isGroupId(firstId)) {
-                const g = groups.find((g) => g.id === firstId);
+                const g = store.getGroupById?.(firstId);
                 currentlyLocked = !!g?.locked;
               } else {
-                const b = activeBlocks.find((b) => b.id === firstId);
+                const b = store.getBlockById?.(firstId);
                 currentlyLocked = !!b?.locked;
               }
-
               const nextLocked = !currentlyLocked;
 
-              // Update groups
+              // compute affected group ids and block ids
               const groupIds = sel.filter(isGroupId);
-              if (groupIds.length > 0) {
-                setGroups((prev) =>
-                  prev.map((g) =>
-                    groupIds.includes(g.id) ? { ...g, locked: nextLocked } : g
-                  )
-                );
-              }
-
-              // Update blocks (including children of groups)
               const blockIds = sel.flatMap((id) =>
-                isGroupId(id)
-                  ? groups.find((g) => g.id === id)?.blockIds ?? []
-                  : [id]
+                isGroupId(id) ? store.getGroupById?.(id)?.blockIds ?? [] : [id]
               );
 
-              if (blockIds.length > 0) {
-                updateActivePageBlocks((prev) =>
-                  prev.map((b) =>
-                    blockIds.includes(b.id) ? { ...b, locked: nextLocked } : b
-                  )
-                );
-              }
+              // build old state snapshots
+              const oldGroupStates = {};
+              groupIds.forEach((gid) => {
+                const g = store.getGroupById?.(gid);
+                if (g) oldGroupStates[gid] = { locked: !!g.locked };
+              });
+
+              const oldBlockStates = {};
+              blockIds.forEach((bid) => {
+                const b = store.getBlockById?.(bid);
+                if (b) oldBlockStates[bid] = { locked: !!b.locked };
+              });
+
+              // compound command (do/undo)
+              const cmd = {
+                do(s) {
+                  // update groups
+                  Object.keys(oldGroupStates).forEach((gid) => {
+                    const g = s.getGroupById?.(gid);
+                    if (g) {
+                      // mutate group in-place or replace array entry depending on your store impl
+                      if (Array.isArray(s.groups)) {
+                        s.groups = s.groups.map((gg) =>
+                          gg.id === gid ? { ...gg, locked: nextLocked } : gg
+                        );
+                      } else if (typeof s.updateGroup === "function") {
+                        s.updateGroup(gid, { locked: nextLocked });
+                      } else {
+                        g.locked = nextLocked;
+                      }
+                    }
+                  });
+
+                  // update blocks
+                  Object.keys(oldBlockStates).forEach((bid) => {
+                    s.updateBlock(bid, { locked: nextLocked });
+                  });
+                },
+                undo(s) {
+                  // restore groups
+                  Object.entries(oldGroupStates).forEach(([gid, patch]) => {
+                    const g = s.getGroupById?.(gid);
+                    if (g) {
+                      if (Array.isArray(s.groups)) {
+                        s.groups = s.groups.map((gg) =>
+                          gg.id === gid ? { ...gg, locked: !!patch.locked } : gg
+                        );
+                      } else if (typeof s.updateGroup === "function") {
+                        s.updateGroup(gid, { locked: !!patch.locked });
+                      } else {
+                        g.locked = !!patch.locked;
+                      }
+                    }
+                  });
+
+                  // restore blocks
+                  Object.entries(oldBlockStates).forEach(([bid, patch]) => {
+                    s.updateBlock(bid, { locked: !!patch.locked });
+                  });
+                },
+              };
+
+              // apply command to store
+              store.applyCommand(cmd);
+
+              // update UI selection / active id unchanged; keep selection as-is
             }}
             onDuplicate={() => {
               // duplicate active selection or single active block
               const targetId =
-                selectedIds.length === 1
+                selectedIds && selectedIds.length === 1
                   ? selectedIds[0]
-                  : activeBlock
-                  ? activeBlock.id
+                  : activeId
+                  ? activeId
                   : null;
               if (!targetId) return;
               handleDuplicateBlock(targetId);
             }}
             onDelete={handleDeleteActive}
             // grouping props
-            canGroup={selectedIds.filter((id) => !isGroupId(id)).length >= 2}
+            canGroup={
+              (selectedIds || []).filter((id) => !isGroupId(id)).length >= 2
+            }
             onGroup={handleCreateGroup}
             canUngroup={
-              selectedIds.some(isGroupId) || isGroupId(activeBlock?.id)
+              (selectedIds || []).some(isGroupId) || isGroupId(activeId)
             }
             onUngroup={() => {
               const gid =
-                selectedIds.find(isGroupId) ||
-                (isGroupId(activeBlock?.id) ? activeBlock.id : null);
+                (selectedIds || []).find(isGroupId) ||
+                (isGroupId(activeId) ? activeId : null);
               if (gid) handleUngroup(gid);
             }}
           />
@@ -2197,10 +3509,10 @@ export default function Home() {
             currentItalic={!!activeBlock?.italic}
             currentUnderline={!!activeBlock?.underline}
             currentStrike={!!activeBlock?.strike}
-            onUndo={undo}
-            onRedo={redo}
-            canUndo={canUndo}
-            canRedo={canRedo}
+            onUndo={() => store.undo()}
+            onRedo={() => store.redo()}
+            canUndo={!!store.canUndo}
+            canRedo={!!store.canRedo}
           />
         </>
       )}
@@ -2212,8 +3524,8 @@ export default function Home() {
           <PositionPanel
             open={isPositionPanelOpen && !!activeBlock}
             onClose={() => setIsPositionPanelOpen(false)}
-            onArrange={() => {}}
-            onAlign={() => {}}
+            onArrange={handleArrange}
+            onAlign={handleAlign}
             blocks={layers}
             activeId={activeId}
             onSelectLayer={handleSelectLayer}
@@ -2250,7 +3562,9 @@ export default function Home() {
                     return (
                       <div
                         key={block.id}
-                        ref={(el) => setBlockRef(activePageId, block.id, el)}
+                        ref={(el) =>
+                          store.setBlockRef(activePageId, block.id, el)
+                        }
                         className={`absolute ${
                           block.locked ? "cursor-default" : "cursor-move"
                         }`}
@@ -2286,3 +3600,5 @@ export default function Home() {
     </div>
   );
 }
+
+export default observer(Home);
